@@ -1,0 +1,11 @@
+venv/
+yolox_env/
+__pycache__/
+*.pyc
+*.pt
+*.mp4
+*.png
+*.avi
+*.log
+ball_detected_frames/
+frames/

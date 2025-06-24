@@ -1,0 +1,6 @@
+path: C:/Users/이동현/Desktop/yolo_ball_dataset
+train: images/train
+val: images/val
+
+names:
+  0: ball

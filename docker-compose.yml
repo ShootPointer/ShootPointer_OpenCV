@@ -1,0 +1,9 @@
+services:
+  flask_app:
+    build: .
+    container_name: basketball-flask
+    ports:
+      - "8888:8888"
+    volumes:
+      - .:/app
+    restart: unless-stopped
