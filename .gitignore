@@ -5,3 +5,5 @@ Add-Content .gitignore ".vscode/"
 Add-Content .gitignore ".idea/"
 Add-Content .gitignore "dist/"
 Add-Content .gitignore "build/"
+.venv/
+.env
