@@ -1,17 +1,18 @@
 FROM python:3.11-slim
 
-# (필요 시 빌드시 컴파일 도구 등 추가 가능)
+# FFmpeg + Tesseract OCR + 빌드 도구
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    ffmpeg \
+    tesseract-ocr \
+    libtesseract-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 의존성 설치
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 앱 소스 복사
 COPY app ./app
 
 EXPOSE 8000

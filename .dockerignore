@@ -1,0 +1,14 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+tmp/
+.DS_Store
+.vscode/
+.idea/
+.env
