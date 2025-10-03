@@ -1,9 +1,35 @@
-Add-Content .gitignore ".venv/"
-Add-Content .gitignore "__pycache__/"
-Add-Content .gitignore "*.pyc"
-Add-Content .gitignore ".vscode/"
-Add-Content .gitignore ".idea/"
-Add-Content .gitignore "dist/"
-Add-Content .gitignore "build/"
+# --- Python ---
 .venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+
+# --- Builds / dists ---
+dist/
+build/
+
+# --- Local env files ---
 .env
+.env.local
+*.env.local
+
+# --- Datasets & media (do not commit large data) ---
+dataset/
+samples/
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+
+# --- Node/npm (just in case) ---
+node_modules/
