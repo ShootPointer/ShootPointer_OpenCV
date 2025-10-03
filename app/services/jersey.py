@@ -6,6 +6,7 @@ import subprocess
 import re
 import tempfile
 import shutil
+import logging
 
 import cv2
 import numpy as np
@@ -14,14 +15,31 @@ import pytesseract
 from app.core.config import settings
 from app.services.ffmpeg import get_duration
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------
 # FFmpeg helpers
 # ---------------------------
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-    )
+    """공통 서브프로세스 실행(타임아웃/로깅 포함)"""
+    to = settings.FFMPEG_TIMEOUT_SEC
+    logger.debug(f"[jersey.ffproc] exec (timeout={to}s): {' '.join(cmd[:6])} ...")
+    try:
+        p = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=to,
+        )
+        logger.debug(f"[jersey.ffproc] returncode={p.returncode}")
+        return p
+    except subprocess.TimeoutExpired:
+        logger.warning(f"[jersey.ffproc] timeout after {to}s")
+        raise
+    except Exception as e:
+        logger.exception(f"[jersey.ffproc] failed: {e}")
+        raise
 
 
 def _sample_frames_to_dir(
@@ -31,6 +49,7 @@ def _sample_frames_to_dir(
     ffmpeg로 일정 fps 간격 프레임을 추출하고 showinfo 로그에서 pts_time(초)을 파싱.
     반환: (임시폴더경로, [(timestamp_sec, frame_path), ...])
     """
+    assert video_path.exists(), f"input not found: {video_path}"
     tmp_dir = Path(tempfile.mkdtemp(prefix="jersey_"))
     out_pattern = tmp_dir / "f_%05d.jpg"
     # 960px로 스케일 제한(속도/인식 안정성), showinfo로 타임스탬프 얻기
@@ -51,7 +70,7 @@ def _sample_frames_to_dir(
     )
 
     times: list[float] = []
-    for line in proc.stderr.splitlines():
+    for line in (proc.stderr or "").splitlines():
         m = re.search(r"pts_time:([0-9]+\.[0-9]+)", line)
         if m:
             try:
@@ -64,6 +83,8 @@ def _sample_frames_to_dir(
     for i, img in enumerate(images):
         if i < len(times):
             pairs.append((times[i], img))
+
+    logger.info(f"[jersey.sample] frames={len(pairs)} (fps={fps})")
     return tmp_dir, pairs
 
 
@@ -73,17 +94,29 @@ def _sample_frames_to_dir(
 def _ocr_digits(img: np.ndarray) -> tuple[str, float]:
     """
     숫자만 인식(whitelist). 간단 신뢰도 추정치(길이에 기반).
+    pytesseract timeout 설정 적용.
     """
     cfg = (
         f"-l eng --oem {settings.JERSEY_TESSERACT_OEM} "
         f"--psm {settings.JERSEY_TESSERACT_PSM} "
         f"-c tessedit_char_whitelist=0123456789"
     )
-    text = pytesseract.image_to_string(img, config=cfg)
-    text = re.sub(r"\D+", "", text)  # 숫자만
+    try:
+        text = pytesseract.image_to_string(
+            img, config=cfg, timeout=settings.OCR_TIMEOUT_SEC
+        )
+    except RuntimeError as e:
+        # pytesseract는 timeout 시 RuntimeError("Timeout ...")를 던질 수 있음
+        logger.warning(f"[jersey.ocr] timeout after {settings.OCR_TIMEOUT_SEC}s: {e}")
+        return "", 0.0
+    except Exception as e:
+        logger.exception(f"[jersey.ocr] failed: {e}")
+        return "", 0.0
+
+    text = re.sub(r"\D+", "", text or "")  # 숫자만
     if not text:
         return "", 0.0
-    conf = min(1.0, max(0.0, len(text) / 2.0))  # 2자리면 1.0로 근사
+    conf = min(1.0, max(0.0, len(text) / 2.0))  # 2자리면 1.0 근사
     return text, conf
 
 
@@ -104,9 +137,7 @@ def _digit_roi_candidates(gray: np.ndarray) -> list[np.ndarray]:
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     mor = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-    contours, _ = cv2.findContours(
-        mor, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
+    contours, _ = cv2.findContours(mor, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     rois: list[np.ndarray] = []
     H, W = gray.shape[:2]
@@ -132,9 +163,7 @@ def _digit_roi_candidates(gray: np.ndarray) -> list[np.ndarray]:
 # time utils
 # ---------------------------
 def _merge_times(times: list[float], max_gap: float) -> list[tuple[float, float]]:
-    """
-    검출 시점들을 인접 간격(max_gap) 기준으로 [start,end] 구간으로 묶기.
-    """
+    """검출 시점들을 인접 간격(max_gap) 기준으로 [start,end] 구간으로 묶기."""
     if not times:
         return []
     times = sorted(times)
@@ -156,9 +185,7 @@ def _expand_and_filter(
     min_dur: float,
     total: float,
 ) -> list[tuple[float, float]]:
-    """
-    구간 앞뒤 pad 확장 후, 너무 짧은 구간 제거 + [0,total] 범위 클램프.
-    """
+    """구간 앞뒤 pad 확장 후, 너무 짧은 구간 제거 + [0,total] 범위 클램프."""
     out: list[tuple[float, float]] = []
     for s, e in segs:
         s2 = max(0.0, s - pad)
@@ -205,9 +232,7 @@ def detect_player_segments(
             found = False
             for roi in rois:
                 # 작은 패치일수록 OCR 유리 → 2배 확대
-                roi_big = cv2.resize(
-                    roi, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_LINEAR
-                )
+                roi_big = cv2.resize(roi, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_LINEAR)
                 text, conf = _ocr_digits(roi_big)
                 if conf >= num_conf and target in text:
                     found = True
@@ -218,6 +243,7 @@ def detect_player_segments(
         # 시점 → 구간 병합, 살짝 확장, 짧은 구간 제거
         segs = _merge_times(hit_times, max_gap=merge_gap)
         segs = _expand_and_filter(segs, pad=0.5, min_dur=min_seg, total=total)
+        logger.info(f"[jersey.segs] jersey={jersey_number} hits={len(hit_times)} segments={len(segs)}")
         return segs
 
     finally:
