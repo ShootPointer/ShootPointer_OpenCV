@@ -13,7 +13,7 @@ pipeline {
             steps {
                 echo "🔄 Cloning FastAPI repository..."
                 dir("${WORKDIR}") {
-                    git branch: 'main', url: 'https://github.com/YourUserName/YourFastAPIRepo.git'
+                    git branch: 'main', url: 'https://github.com/ShootPointer/ShootPointer_OpenCV.git'
                 }
             }
             post {
