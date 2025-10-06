@@ -5,7 +5,7 @@ pipeline {
         // 환경 변수
         DOCKER_COMPOSE_PATH = "/home/ubuntu/fastapi-app"  // 서버 내 docker-compose 위치
         CONTAINER_NAME = "fastapi-app"
-        GIT_REPO = "https://github.com/USERNAME/REPOSITORY.git"
+        GIT_REPO = "https://github.com/ShootPointer/ShootPointer_OpenCV.git"
         BRANCH = "main"
     }
 
