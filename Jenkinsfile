@@ -2,78 +2,98 @@ pipeline {
     agent any
 
     environment {
-        WORKDIR = '/home/ubuntu/fastapi-app'       // FastAPI 프로젝트 경로
-        COMPOSE_SERVICE = 'fast-api'               // docker-compose 서비스명 변경됨
+        WORKDIR = '/home/ubuntu/fastapi-app'        // FastAPI 프로젝트 경로
+        COMPOSE_SERVICE = 'fast-api'                // docker-compose 서비스명
         IMAGE_NAME = 'fastapi-app:latest'
     }
 
     stages {
 
-        stage('Checkout Repository') {
+        stage('Prepare') {
             steps {
-                echo "🔄 Cloning FastAPI repository..."
+                echo "🔄 Cloning FastAPI Repository..."
                 dir("${WORKDIR}") {
                     git branch: 'main', url: 'https://github.com/ShootPointer/ShootPointer_OpenCV.git'
                 }
             }
             post {
-                success { echo "✅ Repository cloned successfully." }
-                failure { echo "❌ Failed to clone repository." }
+                success { sh 'echo "✅ Successfully Cloned Repository"' }
+                failure { sh 'echo "❌ Failed to Clone Repository"' }
+            }
+        }
+
+        stage('Replace .env File') {
+            steps {
+                echo "🔐 Copying Secret .env file..."
+                script {
+                    withCredentials([file(credentialsId: 'SECRET_FILE_OPEN_CV', variable: 'secretFile')]) {
+                        sh 'cp $secretFile ${WORKDIR}/.env'
+                    }
+                }
+            }
+            post {
+                success { sh 'echo "✅ Successfully Replaced .env File"' }
+                failure { sh 'echo "❌ Failed to Replace .env File"' }
             }
         }
 
         stage('Build Docker Image') {
             steps {
                 dir("${WORKDIR}") {
-                    echo "🐳 Building FastAPI Docker image..."
+                    sh 'echo "🐳 Building FastAPI Docker Image..."'
                     sh '''
                     docker build -t ${IMAGE_NAME} .
                     '''
                 }
             }
             post {
-                success { echo "✅ Docker image built successfully." }
-                failure { echo "❌ Docker build failed." }
+                success { sh 'echo "✅ Successfully Built Docker Image"' }
+                failure { sh 'echo "❌ Failed to Build Docker Image"' }
             }
         }
 
         stage('Deploy FastAPI Container') {
             steps {
                 dir("${WORKDIR}") {
-                    echo "🚀 Deploying FastAPI container..."
+                    sh 'echo "🚀 Deploying FastAPI Container..."'
                     script {
                         def running = sh(script: "docker ps -q -f name=${COMPOSE_SERVICE}", returnStdout: true).trim()
+
                         if (running) {
-                            echo "🛑 Stopping and removing existing container..."
+                            sh 'echo "🛑 Stopping and Removing Existing Container..."'
                             sh "docker stop ${COMPOSE_SERVICE} || true"
                             sh "docker rm -f ${COMPOSE_SERVICE} || true"
                         }
 
-                        echo "🚀 Starting new FastAPI container..."
+                        sh 'echo "🚀 Starting New FastAPI Container..."'
                         sh "docker-compose up -d --build ${COMPOSE_SERVICE}"
                     }
                 }
             }
             post {
-                success { echo "✅ FastAPI container deployed successfully." }
-                failure { echo "❌ Deployment failed." }
+                success { sh 'echo "✅ Successfully Deployed FastAPI Container"' }
+                failure { sh 'echo "❌ Failed to Deploy FastAPI Container"' }
             }
         }
 
         stage('Clean Up Old Images') {
             steps {
-                echo "🧹 Cleaning up old images..."
+                sh 'echo "🧹 Cleaning Up Unused Docker Images..."'
                 sh 'docker image prune -f || true'
+            }
+            post {
+                success { sh 'echo "✅ Successfully Cleaned Up Old Images"' }
+                failure { sh 'echo "❌ Failed to Clean Up Images"' }
             }
         }
     }
 
     post {
         success {
-            echo "🎉 FastAPI Deployment completed successfully!"
+            sh 'echo "🎉 FastAPI Deployment Completed Successfully!"'
         }
         failure {
-            echo "💥 Deployment failed. Check the logs above."
+            sh 'echo "💥 FastAPI Deployment Failed. Check the Logs Above."' 
         }
     }
 }
