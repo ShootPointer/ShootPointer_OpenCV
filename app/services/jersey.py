@@ -253,3 +253,23 @@ def detect_player_segments(
                 shutil.rmtree(tmp_dir, ignore_errors=True)
             except Exception:
                 pass
+def ocr_jersey_image_bytes(image_bytes: bytes) -> tuple[str, float]:
+    """
+    업로드된 등번호 '이미지'에서 숫자만 추출.
+    반환: (digits, conf) — conf는 간단 추정치(0.0~1.0)
+    """
+    if not image_bytes:
+        return "", 0.0
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return "", 0.0
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # 작은 입력일수록 확대하면 OCR이 잘 되는 편
+    h, w = gray.shape[:2]
+    if min(h, w) < 120:
+        gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_LINEAR)
+
+    digits, conf = _ocr_digits(gray)
+    return digits, conf

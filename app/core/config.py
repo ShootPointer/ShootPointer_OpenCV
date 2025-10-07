@@ -41,5 +41,10 @@ class Settings(BaseModel):
     # 업로드 최대 크기(바이트). 0 또는 미설정이면 제한 없음
     MAX_UPLOAD_BYTES: int = int(os.getenv("MAX_UPLOAD_BYTES", "209715200"))   # 기본 200MB
 
-settings = Settings()
+    # ── 백엔드 콜백/전달(저장 없이 즉시 업로드) ───────────────
+    BACKEND_SECRET: str = os.getenv("BACKEND_SECRET", "")                     # 백엔드-서버 공유 시크릿(없으면 검증 생략)
+    CALLBACK_CONNECT_TIMEOUT: float = float(os.getenv("CALLBACK_CONNECT_TIMEOUT", "30"))
+    CALLBACK_READ_TIMEOUT: float = float(os.getenv("CALLBACK_READ_TIMEOUT", "60"))
+    CALLBACK_WRITE_TIMEOUT: float = float(os.getenv("CALLBACK_WRITE_TIMEOUT", "60"))
 
+settings = Settings()
