@@ -1,15 +1,42 @@
 # app/core/config.py
 from __future__ import annotations
-from pydantic import BaseModel
-from typing import Optional
 import os
+from pydantic import BaseModel
 
 def _getenv_bool(key: str, default: bool = False) -> bool:
-    """환경변수 불리언 파싱: '1','true','yes','on' → True (대소문자 무시)"""
+    """환경변수 불리언 파싱: '1','true','yes','y','on' → True (대소문자 무시)"""
     val = os.getenv(key)
     if val is None:
         return default
     return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
+
+def _getenv_floats(key: str, default: str) -> list[float]:
+    """콤마 구분 float 리스트 파싱"""
+    raw = os.getenv(key, default)
+    out: list[float] = []
+    for s in raw.split(","):
+        s = s.strip()
+        if not s:
+            continue
+        try:
+            out.append(float(s))
+        except Exception:
+            pass
+    return out
+
+def _getenv_ints(key: str, default: str) -> list[int]:
+    """콤마 구분 int 리스트 파싱"""
+    raw = os.getenv(key, default)
+    out: list[int] = []
+    for s in raw.split(","):
+        s = s.strip()
+        if not s:
+            continue
+        try:
+            out.append(int(s))
+        except Exception:
+            pass
+    return out
 
 class Settings(BaseModel):
     # ── 기본 컷 길이/최대 클립 수 ──────────────────────────────
@@ -26,9 +53,21 @@ class Settings(BaseModel):
     JERSEY_SAMPLE_FPS: float = float(os.getenv("JERSEY_SAMPLE_FPS", "1.5"))   # 초당 샘플 프레임
     JERSEY_MIN_SEG_DUR: float = float(os.getenv("JERSEY_MIN_SEG_DUR", "1.2")) # 최소 구간 길이(초)
     JERSEY_MERGE_GAP: float = float(os.getenv("JERSEY_MERGE_GAP", "2.0"))     # 인접 구간 병합 간격(초)
-    JERSEY_TESSERACT_PSM: str = os.getenv("JERSEY_TESSERACT_PSM", "7")        # 한 줄 숫자 가정
-    JERSEY_TESSERACT_OEM: str = os.getenv("JERSEY_TESSERACT_OEM", "3")        # LSTM 기본
     JERSEY_NUM_CONF: float = float(os.getenv("JERSEY_NUM_CONF", "0.5"))       # 숫자 신뢰도 하한(0~1)
+
+    # ── OCR / Tesseract ───────────────────────────────────────
+    # 단일 PSM(레거시 호환). 예: "7" (한 줄)
+    JERSEY_TESSERACT_PSM: str = os.getenv("JERSEY_TESSERACT_PSM", "7")
+    # OEM 그대로 유지
+    JERSEY_TESSERACT_OEM: str = os.getenv("JERSEY_TESSERACT_OEM", "3")
+    # 여러 PSM을 콤마로 지정해 순차 시도. 지정 없으면 위 단일 PSM으로 fallback.
+    OCR_PSMS: list[int] = _getenv_ints("OCR_PSMS", JERSEY_TESSERACT_PSM)
+    # 스케일 업 비율들(콤마 구분). 숫자가 작거나 흐릴 때 확대 시도.
+    OCR_SCALES: list[float] = _getenv_floats("OCR_SCALES", "1.5,2.0,3.0")
+    # 반전(흰 글자/검은 유니폼 등) 시도
+    OCR_TRY_INVERT: bool = _getenv_bool("OCR_TRY_INVERT", True)
+    # 디버그(실패 원인/후보 로그)
+    DEBUG_OCR: bool = _getenv_bool("DEBUG_OCR", True)
 
     # ── 실행/로깅/안정화 ─────────────────────────────────────
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")                           # DEBUG/INFO/WARNING/ERROR
@@ -38,8 +77,8 @@ class Settings(BaseModel):
     FFMPEG_TIMEOUT_SEC: int = int(os.getenv("FFMPEG_TIMEOUT_SEC", "120"))
     OCR_TIMEOUT_SEC: int = int(os.getenv("OCR_TIMEOUT_SEC", "30"))
 
-    # 업로드 최대 크기(바이트). 0 또는 미설정이면 제한 없음
-    MAX_UPLOAD_BYTES: int = int(os.getenv("MAX_UPLOAD_BYTES", "209715200"))   # 기본 200MB
+    # 업로드 최대 크기(바이트). 0 또는 미설정이면 제한 없음 (기본 200MB)
+    MAX_UPLOAD_BYTES: int = int(os.getenv("MAX_UPLOAD_BYTES", "209715200"))
 
     # ── 백엔드 콜백/전달(저장 없이 즉시 업로드) ───────────────
     BACKEND_SECRET: str = os.getenv("BACKEND_SECRET", "")                     # 백엔드-서버 공유 시크릿(없으면 검증 생략)
