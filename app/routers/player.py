@@ -99,7 +99,7 @@ def _check_backend_token(token: str | None):
 async def ocr_from_image(
     request: Request,
     image: UploadFile = File(..., description="등번호가 보이는 이미지"),
-    backNumber: int | None = Form(None, description="기대 등번호"),
+    backNumber: str | None = Form(None, description="기대 등번호"),
     ackUrl: str | None = Form(None, description="수신확인 콜백 URL"),
 ):
     memberId = request.headers.get("X-Member-Id")
@@ -116,7 +116,7 @@ async def ocr_from_image(
                 },
             )
 
-        detectedNumber = int(digits)
+        detectedNumber = str(digits)
         match = (backNumber == detectedNumber) if backNumber is not None else None
 
         # (선택) ACK 콜백
