@@ -32,7 +32,7 @@ from app.services.streaming import build_zip_spooled, stream_zip_and_cleanup
 from app.services.downloader import download_to_temp  # URL 다운로드(임시파일)
 from app.services.callback import post_zip_to_callback  # 콜백 POST 공용 헬퍼
 
-router = APIRouter(prefix="/player", tags=["player"])
+router = APIRouter(prefix="/api", tags=["player"])
 logger = logging.getLogger(__name__)
 
 # 업로드 임시 폴더
@@ -95,14 +95,14 @@ def _check_backend_token(token: str | None):
 # 헤더: X-Member-Id(optional)
 # 응답: camelCase
 # ─────────────────────────────────────────────────────────────
-@router.post("/ocr")
+@router.post("/send-img", summary="Ocr From Image")
 async def ocr_from_image(
     request: Request,
-    image: UploadFile = File(..., alias="image", description="등번호가 보이는 이미지"),
-    back_number: int | None = Form(None, alias="backNumber", description="(선택) 기대 등번호"),
-    ack_url: str | None = Form(None, alias="ackUrl", description="(선택) 수신확인 콜백 URL"),
+    image: UploadFile = File(..., description="등번호가 보이는 이미지"),
+    backNumber: int | None = Form(None, description="기대 등번호"),
+    ackUrl: str | None = Form(None, description="수신확인 콜백 URL"),
 ):
-    member_id = request.headers.get("X-Member-Id")
+    memberId = request.headers.get("X-Member-Id")
     try:
         img_bytes = await image.read()
         digits, conf = ocr_jersey_image_bytes(img_bytes)
@@ -112,27 +112,27 @@ async def ocr_from_image(
                 content={
                     "status": "error",
                     "message": "숫자를 읽지 못했습니다. 더 선명한 이미지로 시도하세요.",
-                    "memberId": member_id,
+                    "memberId": memberId,
                 },
             )
 
-        detected = int(digits)
-        matched = (back_number == detected) if back_number is not None else None
+        detectedNumber = int(digits)
+        match = (backNumber == detectedNumber) if backNumber is not None else None
 
         # (선택) ACK 콜백
-        if ack_url:
+        if ackUrl:
             try:
                 timeout = httpx.Timeout(5.0, connect=2.0, read=3.0, write=3.0)
                 async with httpx.AsyncClient(timeout=timeout) as client:
                     await client.post(
-                        ack_url,
+                        ackUrl,
                         json={
                             "status": "ok",
-                            "detectedNumber": detected,
+                            "detectedNumber": detectedNumber,
                             "confidence": conf,
-                            "expectedNumber": back_number,
-                            "match": matched,
-                            "memberId": member_id,
+                            "expectedNumber": backNumber,
+                            "match": match,
+                            "memberId": memberId,
                         },
                     )
             except Exception:
@@ -140,55 +140,59 @@ async def ocr_from_image(
 
         return {
             "status": "ok",
-            "detectedNumber": detected,
+            "detectedNumber": detectedNumber,
             "confidence": conf,
-            "expectedNumber": back_number,
-            "match": matched,
-            "memberId": member_id,
+            "expectedNumber": backNumber,
+            "match": match,
+            "memberId": memberId,
         }
 
     except Exception as e:
         logger.exception("[/ocr] failed: %s", e)
         return JSONResponse(
             status_code=400,
-            content={"status": "error", "message": str(e), "memberId": member_id},
+            content={"status": "error", "message": str(e), "memberId": memberId},
         )
-
 
 # ─────────────────────────────────────────────────────────────
 # API: 세그먼트(플레이 구간) 검출
 #  - jersey_image가 있으면 OCR로 번호 추출 후 사용
 # ─────────────────────────────────────────────────────────────
-@router.post("/segments")
+@router.post("/segments", summary="Detect Segments From Video")
 async def player_segments(
-    video: UploadFile = File(..., alias="video", description="풀경기 영상(mp4 등)"),
-    jersey_number: int | None = Form(None, alias="jerseyNumber", description="찾을 등번호 (예: 23). 이미지가 있으면 생략 가능"),
-    jersey_image: UploadFile | None = File(None, alias="jerseyImage", description="등번호가 보이는 이미지(선택)"),
+    videoFile: UploadFile = File(..., description="풀경기 영상(mp4 등)"),
+    jerseyNumber: int | None = Form(None, description="찾을 등번호 (예: 23). 이미지가 있으면 생략 가능"),
+    jerseyImage: UploadFile | None = File(None, description="등번호가 보이는 이미지(선택)"),
 ):
     """
     업로드된 영상에서 등번호 기반 플레이 구간을 검출해 [start,end] 초 리스트 반환.
     jerseyImage가 제공되면 OCR로 숫자를 추출해 jerseyNumber로 사용.
     """
-    tmp_in = _save_upload(video)
+    # 업로드 저장
+    tmp_in = _save_upload(videoFile)
     try:
         # 이미지 우선(OCR)
-        if jersey_image is not None:
-            img_bytes = await jersey_image.read()
+        if jerseyImage is not None:
+            img_bytes = await jerseyImage.read()
             digits, conf = ocr_jersey_image_bytes(img_bytes)
             if not digits:
                 raise RuntimeError("등번호 이미지를 읽지 못했습니다. 더 선명하게 촬영해주세요.")
-            jersey_number = int(digits)
-            logger.info(f"[segments] jersey_image OCR -> {jersey_number} (conf={conf:.2f})")
+            jerseyNumber = int(digits)
+            logger.info(f"[segments] jerseyImage OCR -> {jerseyNumber} (conf={conf:.2f})")
 
-        if jersey_number is None:
+        if jerseyNumber is None:
             raise RuntimeError("jerseyNumber 또는 jerseyImage 중 하나는 반드시 제공해야 합니다.")
 
-        segs = detect_player_segments(tmp_in, jersey_number)
-        logger.info(f"[player/segments] jersey={jersey_number} -> segments={len(segs)}")
-        return {"segments": segs, "jerseyNumber": jersey_number}
+        # 구간 검출
+        segs = detect_player_segments(tmp_in, jerseyNumber)
+        logger.info(f"[player/segments] jersey={jerseyNumber} -> segments={len(segs)}")
+
+        return {"segments": segs, "jerseyNumber": jerseyNumber}
+
     except Exception as e:
         logger.exception(f"[player/segments] failed: {e}")
         return JSONResponse(status_code=400, content={"error": str(e)})
+
     finally:
         try:
             tmp_in.unlink(missing_ok=True)
@@ -202,61 +206,69 @@ async def player_segments(
 #  - 디스크에 영구 저장 없음(응답 종료 후 임시 삭제)
 #  - jersey_image가 있으면 OCR로 번호 추출 후 사용
 # ─────────────────────────────────────────────────────────────
-@router.post("/highlight")
+@router.post("/highlight", summary="Generate Highlights Zip")
 async def player_highlight_zip(
-    video: UploadFile = File(..., description="풀경기 영상(mp4 등)"),
-    timestamps: str = Form(..., alias="timestamps", description="쉼표구분 초 리스트, 예: 30,75,120"),
-    jersey_number: int | None = Form(None, alias="jerseyNumber", description="찾을 등번호 (예: 23). 이미지가 있으면 생략 가능"),
-    jersey_image: UploadFile | None = File(None, alias="jerseyImage", description="등번호가 보이는 이미지(선택)"),
-    pre: float = Form(default=settings.DEFAULT_PRE, alias="pre"),
-    post: float = Form(default=settings.DEFAULT_POST, alias="post"),
-    max_clips: int = Form(default=settings.MAX_CLIPS, alias="maxClips"),
+    videoFile: UploadFile = File(..., description="풀경기 영상(mp4 등)"),
+    timestamps: str = Form(..., description="쉼표구분 초 리스트, 예: 30,75,120"),
+    jerseyNumber: int | None = Form(None, description="찾을 등번호 (예: 23). 이미지가 있으면 생략 가능"),
+    jerseyImage: UploadFile | None = File(None, description="등번호가 보이는 이미지(선택)"),
+    pre: float = Form(default=settings.DEFAULT_PRE),
+    post: float = Form(default=settings.DEFAULT_POST),
+    maxClips: int = Form(default=settings.MAX_CLIPS),
 ):
     """
-    1) jersey_image가 있으면 OCR로 번호 추출 → jersey_number로 사용
+    1) jerseyImage가 있으면 OCR로 번호 추출 → jerseyNumber로 사용
     2) 등번호 기반 구간 검출 → timestamps 필터 → 컷팅 → ZIP 스트리밍
+    (임시 파일은 응답 종료 후 자동 삭제)
     """
-    tmp_in = _save_upload(video)
+    # 업로드 저장
+    tmp_in = _save_upload(videoFile)
     clip_paths: List[Path] = []
     tmp_to_cleanup: List[Path] = [tmp_in]
 
     try:
-        # 이미지 우선(OCR)
-        if jersey_image is not None:
-            img_bytes = await jersey_image.read()
+        # 1) 이미지가 있으면 OCR로 번호 추출
+        if jerseyImage is not None:
+            img_bytes = await jerseyImage.read()
             digits, conf = ocr_jersey_image_bytes(img_bytes)
             if not digits:
                 raise RuntimeError("등번호 이미지를 읽지 못했습니다. 더 선명하게 촬영해주세요.")
-            jersey_number = int(digits)
-            logger.info(f"[highlight] jersey_image OCR -> {jersey_number} (conf={conf:.2f})")
+            jerseyNumber = int(digits)
+            logger.info(f"[highlight] jerseyImage OCR -> {jerseyNumber} (conf={conf:.2f})")
 
-        if jersey_number is None:
+        if jerseyNumber is None:
             raise RuntimeError("jerseyNumber 또는 jerseyImage 중 하나는 반드시 제공해야 합니다.")
 
-        segments = detect_player_segments(tmp_in, jersey_number)
+        # 2) 선수 구간 검출
+        segments = detect_player_segments(tmp_in, jerseyNumber)
 
+        # 3) 타임스탬프 파싱 + 선수 구간 필터
         events = _parse_timestamps(timestamps)
         events = [t for t in events if _in_any_segment(t, segments)] if segments else events
         if not events:
             raise RuntimeError("선수 구간과 겹치는 이벤트가 없습니다. (timestamps/등번호/이미지 확인)")
 
-        if max_clips and max_clips > 0:
-            events = events[:max_clips]
+        # 상한 적용
+        if maxClips and maxClips > 0:
+            events = events[:maxClips]
 
         logger.info(
-            f"[player/highlight] jersey={jersey_number} events={events} pre={pre} post={post} max={max_clips}"
+            f"[player/highlight] jersey={jerseyNumber} events={events} pre={pre} post={post} max={maxClips}"
         )
 
+        # 4) 클립 생성
         results = generate_highlight_clips(
-            tmp_in, jersey_number, events, pre=pre, post=post, max_clips=max_clips
+            tmp_in, jerseyNumber, events, pre=pre, post=post, max_clips=maxClips
         )
         clip_paths = [Path(p) for _, p in results]
 
-        spooled = build_zip_spooled(clip_paths, arc_prefix=f"#{jersey_number}_")
+        # 5) ZIP → 스풀 파일 → 스트리밍 응답
+        spooled = build_zip_spooled(clip_paths, arc_prefix=f"#{jerseyNumber}_")
         return stream_zip_and_cleanup(spooled, clip_paths, tmp_to_cleanup)
 
     except Exception as e:
         logger.exception(f"[player/highlight] failed: {e}")
+        # 실패 시 임시파일 정리
         for p in clip_paths:
             try:
                 Path(p).unlink(missing_ok=True)
