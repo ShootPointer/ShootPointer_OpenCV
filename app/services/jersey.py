@@ -11,6 +11,7 @@ import logging
 import cv2
 import numpy as np
 import pytesseract
+import io
 
 from app.core.config import settings
 from app.services.ffmpeg import get_duration
@@ -273,3 +274,29 @@ def ocr_jersey_image_bytes(image_bytes: bytes) -> tuple[str, float]:
 
     digits, conf = _ocr_digits(gray)
     return digits, conf
+# (하단에 추가) 단일 이미지 바이트에서 숫자만 OCR하는 헬퍼
+def ocr_jersey_image_bytes(img_bytes: bytes) -> tuple[str, float]:
+    """
+    등번호 사진 1장을 받아 숫자만 OCR. 간단 신뢰도 추정치 반환.
+    - return: (digits, conf)  e.g. ("12", 0.9) / ("", 0.0)
+    """
+    if not img_bytes:
+        return "", 0.0
+    # 바이트 → OpenCV 이미지
+    arr = np.frombuffer(img_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return "", 0.0
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # 기존 ROI 추출 재사용 (크게 한 번 확대한 후 OCR)
+    rois = _digit_roi_candidates(gray)
+    best_digits, best_conf = "", 0.0
+    for roi in rois or [gray]:
+        roi_big = cv2.resize(roi, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_LINEAR)
+        digits, conf = _ocr_digits(roi_big)
+        if conf > best_conf:
+            best_digits, best_conf = digits, conf
+
+    return best_digits, best_conf
