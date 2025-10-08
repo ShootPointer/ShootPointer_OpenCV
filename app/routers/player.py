@@ -17,6 +17,7 @@ from fastapi import (
     Body,
     HTTPException,
     BackgroundTasks,
+    Request,
 )
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
@@ -24,12 +25,12 @@ from pydantic import BaseModel
 from app.core.config import settings
 from app.services.jersey import (
     detect_player_segments,
-    ocr_jersey_image_bytes,  # 등번호 사진 OCR 헬퍼
+    ocr_jersey_image_bytes,  # 등번호 사진 OCR
 )
 from app.services.pipeline import generate_highlight_clips
 from app.services.streaming import build_zip_spooled, stream_zip_and_cleanup
-from app.services.downloader import download_to_temp  # URL 다운로드(비영구, 임시파일)
-from app.services.callback import post_zip_to_callback  # 콜백 업로드 공용 헬퍼
+from app.services.downloader import download_to_temp  # URL 다운로드(임시파일)
+from app.services.callback import post_zip_to_callback  # 콜백 POST 공용 헬퍼
 
 router = APIRouter(prefix="/player", tags=["player"])
 logger = logging.getLogger(__name__)
@@ -89,80 +90,85 @@ def _check_backend_token(token: str | None):
 
 
 # ─────────────────────────────────────────────────────────────
-# 0) (유지) 단순 OCR: 등번호 '이미지'에서 숫자 추출
+# API: 등번호 사진 → 숫자 추출(OCR)  (백엔드 WebClient와 1:1 매핑)
+# multipart: image(file), backNumber(optional), ackUrl(optional)
+# 헤더: X-Member-Id(optional)
+# 응답: camelCase
 # ─────────────────────────────────────────────────────────────
-@router.post("/parse-jersey")
-async def parse_jersey_number_from_image(
-    image: UploadFile = File(..., description="등번호가 보이는 이미지")
+@router.post("/ocr")
+async def ocr_from_image(
+    request: Request,
+    image: UploadFile = File(..., alias="image", description="등번호가 보이는 이미지"),
+    back_number: int | None = Form(None, alias="backNumber", description="(선택) 기대 등번호"),
+    ack_url: str | None = Form(None, alias="ackUrl", description="(선택) 수신확인 콜백 URL"),
 ):
-    """등번호 '이미지'에서 숫자(OCR)만 추출."""
+    member_id = request.headers.get("X-Member-Id")
     try:
         img_bytes = await image.read()
         digits, conf = ocr_jersey_image_bytes(img_bytes)
         if not digits:
             return JSONResponse(
                 status_code=400,
-                content={"error": "숫자를 읽지 못했습니다. 더 선명한 이미지로 시도하세요."},
+                content={
+                    "status": "error",
+                    "message": "숫자를 읽지 못했습니다. 더 선명한 이미지로 시도하세요.",
+                    "memberId": member_id,
+                },
             )
-        return {"number": digits, "confidence": conf}
-    except Exception as e:
-        logger.exception(f"[parse-jersey] failed: {e}")
-        return JSONResponse(status_code=400, content={"error": str(e)})
 
+        detected = int(digits)
+        matched = (back_number == detected) if back_number is not None else None
 
-# ─────────────────────────────────────────────────────────────
-# 1) (신규) OCR 확인 + 선택적 ACK
-#    - expected_number와 이미지만 먼저 전달받아 일치 여부 반환
-#    - ack_url이 있으면 즉시 결과를 POST 해줌
-# ─────────────────────────────────────────────────────────────
-@router.post("/ocr")
-async def ocr_jersey_endpoint(
-    jersey_image: UploadFile = File(..., description="등번호가 보이는 이미지"),
-    expected_number: int = Form(..., description="백엔드/사용자가 선택한 등번호"),
-    ack_url: str | None = Form(None, description="(선택) OCR 결과를 즉시 받을 콜백 URL"),
-):
-    try:
-        img_bytes = await jersey_image.read()
-        digits, conf = ocr_jersey_image_bytes(img_bytes)
-        detected = int(digits) if digits else None
-        match = (detected == expected_number)
-
-        payload = {
-            "status": "ok",
-            "detected_number": detected,
-            "confidence": round(conf, 3),
-            "expected_number": expected_number,
-            "match": match,
-        }
-
+        # (선택) ACK 콜백
         if ack_url:
             try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    r = await client.post(ack_url, json=payload)
-                    r.raise_for_status()
-                payload["ack_posted"] = True
-            except Exception as e:
-                logger.warning(f"[ocr] ack failed: {e}")
-                payload["ack_posted"] = False
+                timeout = httpx.Timeout(5.0, connect=2.0, read=3.0, write=3.0)
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    await client.post(
+                        ack_url,
+                        json={
+                            "status": "ok",
+                            "detectedNumber": detected,
+                            "confidence": conf,
+                            "expectedNumber": back_number,
+                            "match": matched,
+                            "memberId": member_id,
+                        },
+                    )
+            except Exception:
+                logger.warning("[/ocr] ack callback failed", exc_info=True)
 
-        return payload
+        return {
+            "status": "ok",
+            "detectedNumber": detected,
+            "confidence": conf,
+            "expectedNumber": back_number,
+            "match": matched,
+            "memberId": member_id,
+        }
 
     except Exception as e:
-        logger.exception(f"[ocr] failed: {e}")
-        return JSONResponse(status_code=400, content={"error": str(e)})
+        logger.exception("[/ocr] failed: %s", e)
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": str(e), "memberId": member_id},
+        )
 
 
 # ─────────────────────────────────────────────────────────────
-# 2) 세그먼트(플레이 구간) 검출
-#    - jersey_image가 있으면 OCR로 번호 추출 후 사용(유지)
-#    - 권장 플로우는 /ocr → 여기선 확정 번호만 쓰는 형태
+# API: 세그먼트(플레이 구간) 검출
+#  - jersey_image가 있으면 OCR로 번호 추출 후 사용
 # ─────────────────────────────────────────────────────────────
 @router.post("/segments")
 async def player_segments(
-    video: UploadFile = File(..., description="풀경기 영상(mp4 등)"),
-    jersey_number: int | None = Form(None, description="찾을 등번호 (예: 23). 이미지가 있으면 생략 가능"),
-    jersey_image: UploadFile | None = File(None, description="등번호가 보이는 이미지(선택)"),
+    video: UploadFile = File(..., alias="video", description="풀경기 영상(mp4 등)"),
+    jersey_number: int | None = Form(None, alias="jerseyNumber", description="찾을 등번호 (예: 23). 이미지가 있으면 생략 가능"),
+    jersey_image: UploadFile | None = File(None, alias="jerseyImage", description="등번호가 보이는 이미지(선택)"),
 ):
+    """
+    업로드된 영상에서 등번호 기반 플레이 구간을 검출해 [start,end] 초 리스트 반환.
+    jerseyImage가 제공되면 OCR로 숫자를 추출해 jerseyNumber로 사용.
+    """
     tmp_in = _save_upload(video)
     try:
         # 이미지 우선(OCR)
@@ -175,11 +181,11 @@ async def player_segments(
             logger.info(f"[segments] jersey_image OCR -> {jersey_number} (conf={conf:.2f})")
 
         if jersey_number is None:
-            raise RuntimeError("jersey_number 또는 jersey_image 중 하나는 반드시 제공해야 합니다.")
+            raise RuntimeError("jerseyNumber 또는 jerseyImage 중 하나는 반드시 제공해야 합니다.")
 
         segs = detect_player_segments(tmp_in, jersey_number)
         logger.info(f"[player/segments] jersey={jersey_number} -> segments={len(segs)}")
-        return {"segments": segs, "jersey_number": jersey_number}
+        return {"segments": segs, "jerseyNumber": jersey_number}
     except Exception as e:
         logger.exception(f"[player/segments] failed: {e}")
         return JSONResponse(status_code=400, content={"error": str(e)})
@@ -191,19 +197,25 @@ async def player_segments(
 
 
 # ─────────────────────────────────────────────────────────────
-# 3) 하이라이트 ZIP 스트리밍 응답(파일 저장 없이)
-#    - jersey_image가 있으면 OCR로 번호 추출 후 사용
+# API: 하이라이트 ZIP 생성 (타임스탬프 필터링 + 컷팅)
+#  - 업로드(멀티파트) → 처리 → ZIP을 "스트리밍"으로 바로 응답
+#  - 디스크에 영구 저장 없음(응답 종료 후 임시 삭제)
+#  - jersey_image가 있으면 OCR로 번호 추출 후 사용
 # ─────────────────────────────────────────────────────────────
 @router.post("/highlight")
 async def player_highlight_zip(
     video: UploadFile = File(..., description="풀경기 영상(mp4 등)"),
-    timestamps: str = Form(..., description="쉼표구분 초 리스트, 예: 30,75,120"),
-    jersey_number: int | None = Form(None, description="찾을 등번호 (예: 23). 이미지가 있으면 생략 가능"),
-    jersey_image: UploadFile | None = File(None, description="등번호가 보이는 이미지(선택)"),
-    pre: float = Form(default=settings.DEFAULT_PRE),
-    post: float = Form(default=settings.DEFAULT_POST),
-    max_clips: int = Form(default=settings.MAX_CLIPS),
+    timestamps: str = Form(..., alias="timestamps", description="쉼표구분 초 리스트, 예: 30,75,120"),
+    jersey_number: int | None = Form(None, alias="jerseyNumber", description="찾을 등번호 (예: 23). 이미지가 있으면 생략 가능"),
+    jersey_image: UploadFile | None = File(None, alias="jerseyImage", description="등번호가 보이는 이미지(선택)"),
+    pre: float = Form(default=settings.DEFAULT_PRE, alias="pre"),
+    post: float = Form(default=settings.DEFAULT_POST, alias="post"),
+    max_clips: int = Form(default=settings.MAX_CLIPS, alias="maxClips"),
 ):
+    """
+    1) jersey_image가 있으면 OCR로 번호 추출 → jersey_number로 사용
+    2) 등번호 기반 구간 검출 → timestamps 필터 → 컷팅 → ZIP 스트리밍
+    """
     tmp_in = _save_upload(video)
     clip_paths: List[Path] = []
     tmp_to_cleanup: List[Path] = [tmp_in]
@@ -219,7 +231,7 @@ async def player_highlight_zip(
             logger.info(f"[highlight] jersey_image OCR -> {jersey_number} (conf={conf:.2f})")
 
         if jersey_number is None:
-            raise RuntimeError("jersey_number 또는 jersey_image 중 하나는 반드시 제공해야 합니다.")
+            raise RuntimeError("jerseyNumber 또는 jerseyImage 중 하나는 반드시 제공해야 합니다.")
 
         segments = detect_player_segments(tmp_in, jersey_number)
 
@@ -258,8 +270,7 @@ async def player_highlight_zip(
 
 
 # ─────────────────────────────────────────────────────────────
-# 4) URL 입력 버전 (S3 presigned URL 등) — 서버 간 대용량에 적합
-#    - 원본을 영구 저장하지 않고, 임시파일만 사용 후 스트리밍 응답
+# (선택) API: URL 입력 버전 — 서버 간 대용량에 적합
 # ─────────────────────────────────────────────────────────────
 class HighlightByUrlReq(BaseModel):
     video_url: str
@@ -275,8 +286,7 @@ async def highlight_by_url(payload: HighlightByUrlReq = Body(...)):
     tmp_to_cleanup: List[Path] = []
 
     try:
-        suffix = ".mp4"
-        tmp_in = await download_to_temp(payload.video_url, suffix=suffix)
+        tmp_in = await download_to_temp(payload.video_url, suffix=".mp4")
         tmp_to_cleanup.append(tmp_in)
 
         pre = payload.pre if payload.pre is not None else settings.DEFAULT_PRE
@@ -320,38 +330,109 @@ async def highlight_by_url(payload: HighlightByUrlReq = Body(...)):
 
 
 # ─────────────────────────────────────────────────────────────
-# 5) 콜백 업로드(옵션 B)
-#    - 영상 업로드 → ZIP 생성 → callback_url로 멀티파트 POST
-#    - 여기에 수신 ACK(ack_url)도 추가 (영상 저장 없이 수신 즉시 알림)
+# 옵션 B: ZIP을 백엔드 콜백 URL로 멀티파트 POST 전송(서버에 저장 없이)
+#  - 백엔드 수신 엔드포인트는 multipart/form-data 의 file 필드명으로 ZIP 수신
+# ─────────────────────────────────────────────────────────────
+class HighlightCallbackReq(BaseModel):
+    callback_url: str               # 백엔드 수신 URL
+    jersey_number: int
+    timestamps: List[float]
+    pre: float | None = None
+    post: float | None = None
+    max_clips: int | None = None
+
+@router.post("/highlight-callback")
+async def player_highlight_callback(
+    video: UploadFile = File(..., description="풀경기 영상(mp4 등)"),
+    payload: str = Form(..., description='JSON 문자열: {"callback_url": "...", "jersey_number": 5, "timestamps": [..], "pre":..,"post":..,"max_clips":..}')
+):
+    try:
+        data = HighlightCallbackReq(**json.loads(payload))
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": f"invalid payload: {e}"})
+
+    tmp_in = _save_upload(video)
+    clip_paths: List[Path] = []
+    tmp_to_cleanup: List[Path] = [tmp_in]
+
+    try:
+        segments = detect_player_segments(tmp_in, data.jersey_number)
+
+        events = sorted(set([float(t) for t in (data.timestamps or []) if t is not None and t >= 0.0]))
+        events = [t for t in events if _in_any_segment(t, segments)] if segments else events
+        if not events:
+            raise RuntimeError("선수 구간과 겹치는 타임스탬프가 없습니다.")
+
+        pre = data.pre if data.pre is not None else settings.DEFAULT_PRE
+        post = data.post if data.post is not None else settings.DEFAULT_POST
+        maxc = data.max_clips if data.max_clips is not None else settings.MAX_CLIPS
+
+        results = generate_highlight_clips(
+            tmp_in, data.jersey_number, events, pre=pre, post=post, max_clips=maxc
+        )
+        clip_paths = [Path(p) for _, p in results]
+
+        spooled = build_zip_spooled(clip_paths, arc_prefix=f"#{data.jersey_number}_")
+
+        timeout = httpx.Timeout(60.0, connect=30.0, read=60.0, write=60.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            files = {"file": ("player_highlights.zip", spooled, "application/zip")}
+            resp = await client.post(data.callback_url, files=files)
+            resp.raise_for_status()
+
+        for p in clip_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+        for t in tmp_to_cleanup:
+            try:
+                Path(t).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        return {"status": "delivered", "callbackUrl": data.callback_url, "clips": len(clip_paths)}
+
+    except Exception as e:
+        logger.exception(f"[player/highlight-callback] failed: {e}")
+        for p in clip_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+        for t in tmp_to_cleanup:
+            try:
+                Path(t).unlink(missing_ok=True)
+            except Exception:
+                pass
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────
+# 백엔드 연동: 업로드 or URL로 받으면 → ZIP 생성 → 콜백 POST
+#  - ingest-upload  : multipart 업로드 방식 (camelCase alias)
+#  - ingest-url     : presigned URL 등 링크 방식
+#  - ingest-async   : 202 즉시 응답, 백그라운드에서 콜백 POST (간단 버전)
 # ─────────────────────────────────────────────────────────────
 @router.post("/ingest-upload")
 async def ingest_upload_for_backend(
+    request: Request,
     video: UploadFile = File(..., description="백엔드에서 전달한 원본 영상"),
-    jersey_number: int = Form(...),
-    timestamps: str = Form(..., description="예: 30,75,120"),
-    callback_url: str = Form(..., description="백엔드 콜백 URL"),
-    ack_url: str | None = Form(None, description="(선택) 영상 수신 ACK URL"),
-    pre: float = Form(default=settings.DEFAULT_PRE),
-    post: float = Form(default=settings.DEFAULT_POST),
-    max_clips: int = Form(default=settings.MAX_CLIPS),
-    token: str | None = Form(default=None, description="백앤드-서버 공유 시크릿"),
+    jersey_number: int = Form(..., alias="jerseyNumber"),
+    timestamps: str = Form(..., alias="timestamps", description="예: 30,75,120"),
+    callback_url: str = Form(..., alias="callbackUrl", description="백엔드 콜백 URL"),
+    ack_url: str | None = Form(None, alias="ackUrl"),
+    pre: float = Form(default=settings.DEFAULT_PRE, alias="pre"),
+    post: float = Form(default=settings.DEFAULT_POST, alias="post"),
+    max_clips: int = Form(default=settings.MAX_CLIPS, alias="maxClips"),
+    token: str | None = Form(default=None, alias="token"),
 ):
     _check_backend_token(token)
+    member_id = request.headers.get("X-Member-Id")
+
     tmp_in = _save_upload(video)
     tmp_to_cleanup: List[Path] = [tmp_in]
     clips: List[Path] = []
-
-    # 수신 ACK (선택)
-    if ack_url:
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                await client.post(
-                    ack_url,
-                    json={"status": "received", "bytes": tmp_in.stat().st_size},
-                )
-        except Exception as e:
-            logger.warning(f"[ingest-upload] ack failed: {e}")
-
     try:
         segs = detect_player_segments(tmp_in, jersey_number)
         events = _parse_timestamps(timestamps)
@@ -361,9 +442,7 @@ async def ingest_upload_for_backend(
         if max_clips and max_clips > 0:
             events = events[:max_clips]
 
-        res = generate_highlight_clips(
-            tmp_in, jersey_number, events, pre=pre, post=post, max_clips=max_clips
-        )
+        res = generate_highlight_clips(tmp_in, jersey_number, events, pre=pre, post=post, max_clips=max_clips)
         clips = [Path(p) for _, p in res]
 
         spooled = build_zip_spooled(clips, arc_prefix=f"#{jersey_number}_")
@@ -371,14 +450,24 @@ async def ingest_upload_for_backend(
         status = await post_zip_to_callback(
             callback_url,
             spooled,
-            meta={"jersey_number": jersey_number, "events": events},
+            meta={"jerseyNumber": jersey_number, "events": events, "memberId": member_id},
             bearer_or_token=None,
         )
         logger.info(f"[ingest-upload] delivered -> {callback_url} ({status})")
-        return {"status": "delivered", "clips": len(clips)}
+
+        # (선택) ACK 즉시 신호
+        if ack_url:
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+                    await client.post(ack_url, json={"status": "accepted", "memberId": member_id})
+            except Exception:
+                logger.warning("[ingest-upload] ack failed", exc_info=True)
+
+        return {"status": "delivered", "clips": len(clips), "memberId": member_id}
+
     except Exception as e:
         logger.exception(f"[ingest-upload] failed: {e}")
-        return JSONResponse(status_code=400, content={"error": str(e)})
+        return JSONResponse(status_code=400, content={"status": "error", "message": str(e), "memberId": member_id})
     finally:
         for p in clips:
             try:
@@ -392,9 +481,6 @@ async def ingest_upload_for_backend(
                 pass
 
 
-# ─────────────────────────────────────────────────────────────
-# 6) URL로 받아서 콜백 POST (유지)
-# ─────────────────────────────────────────────────────────────
 class IngestUrlReq(BaseModel):
     video_url: str
     jersey_number: int
@@ -420,7 +506,6 @@ async def ingest_url_for_backend(body: IngestUrlReq):
         maxc = body.max_clips if body.max_clips is not None else settings.MAX_CLIPS
 
         segs = detect_player_segments(tmp_in, body.jersey_number)
-
         events = sorted(set([float(t) for t in (body.timestamps or []) if t >= 0.0]))
         events = [t for t in events if _in_any_segment(t, segs)] if segs else events
         if not events:
@@ -428,9 +513,7 @@ async def ingest_url_for_backend(body: IngestUrlReq):
         if maxc and maxc > 0:
             events = events[:maxc]
 
-        res = generate_highlight_clips(
-            tmp_in, body.jersey_number, events, pre=pre, post=post, max_clips=maxc
-        )
+        res = generate_highlight_clips(tmp_in, body.jersey_number, events, pre=pre, post=post, max_clips=maxc)
         clips = [Path(p) for _, p in res]
 
         spooled = build_zip_spooled(clips, arc_prefix=f"#{body.jersey_number}_")
@@ -438,7 +521,7 @@ async def ingest_url_for_backend(body: IngestUrlReq):
         status = await post_zip_to_callback(
             body.callback_url,
             spooled,
-            meta={"jersey_number": body.jersey_number, "events": events},
+            meta={"jerseyNumber": body.jersey_number, "events": events},
             bearer_or_token=None,
         )
         logger.info(f"[ingest-url] delivered -> {body.callback_url} ({status})")
@@ -462,9 +545,7 @@ async def ingest_url_for_backend(body: IngestUrlReq):
                 pass
 
 
-# ─────────────────────────────────────────────────────────────
-# 7) 202 즉시 응답 + 백그라운드에서 콜백 POST (간단 비동기)
-# ─────────────────────────────────────────────────────────────
+# 202 즉시 응답 + 백그라운드에서 콜백 POST (간단 버전)
 JOBS: dict[str, dict] = {}
 
 class IngestAsyncReq(BaseModel):
@@ -523,6 +604,7 @@ async def ingest_async_for_backend(body: IngestAsyncReq, background: BackgroundT
             spooled = build_zip_spooled(clips, arc_prefix=f"#{body.jersey_number}_")
 
             JOBS[job_id]["status"] = "uploading"
+            # 동기 업로드
             with httpx.Client(timeout=httpx.Timeout(60.0, connect=30.0, read=60.0, write=60.0)) as client:
                 files = {"file": ("player_highlights.zip", spooled, "application/zip")}
                 r = client.post(body.callback_url, files=files)
@@ -548,7 +630,7 @@ async def ingest_async_for_backend(body: IngestAsyncReq, background: BackgroundT
                     pass
 
     background.add_task(_task)
-    return JSONResponse(status_code=202, content={"job_id": job_id})
+    return JSONResponse(status_code=202, content={"jobId": job_id})
 
 @router.get("/jobs/{job_id}")
 async def job_status(job_id: str):
