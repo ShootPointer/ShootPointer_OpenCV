@@ -96,7 +96,7 @@ async def send_img(
     이미지에서 등번호를 OCR로 추출해 캐시에 저장.
     - 헤더 `X-Member-Id` 로 사용자 구분(없으면 __GLOBAL__).
     - backNumber는 '문자열'로 받고 내부에서 숫자만 추출해 비교/힌트로 사용.
-    - 성공: 200 {detectedNumber, confidence, expectedNumber, match, memberId, tookMs}
+    - 성공: 200 {status:200, success:true, backNumber, confidence, match}
     - 유효성/처리 실패: 4xx {status:'error', step, message, memberId}
     """
     t0 = time.perf_counter()
@@ -153,7 +153,6 @@ async def send_img(
             )
 
         # ✅ 2-1) 너무 크면 리사이즈 후, PNG로 재인코딩하여 OCR 입력 바이트 교체
-        #   - 짧은 변 기준 1000px로 축소 (속도↑, 품질 손실 최소화)
         step = "resize_if_needed"
         try:
             shorter = min(W, H)
@@ -161,14 +160,12 @@ async def send_img(
                 scale = 1000.0 / float(shorter)
                 bgr = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
                 H, W = bgr.shape[:2]
-                # PNG로 재인코딩하여 img_bytes 갱신 (무손실/안정적)
                 ok, enc = cv2.imencode(".png", bgr)
                 if not ok:
                     raise ValueError("리사이즈 후 인코딩 실패")
                 img_bytes = enc.tobytes()
                 logger.info(f"[/send-img] resized for OCR = {W}x{H}")
         except Exception as e:
-            # 리사이즈 실패 시 원본 바이트로 진행(경고만)
             logger.warning(f"[/send-img] resize skipped due to error: {e}")
 
         # DEBUG 모드면 OCR 주요 세팅 로그
@@ -196,7 +193,6 @@ async def send_img(
             else:
                 digits, conf = ocr_jersey_image_bytes(img_bytes)
         except Exception as e:
-            # 함수가 없거나 내부에서 오류가 난 경우 기본으로 폴백
             logger.warning(f"[/send-img] hint OCR unavailable or failed: {e}")
             digits, conf = ocr_jersey_image_bytes(img_bytes)
 
@@ -216,7 +212,6 @@ async def send_img(
         JERSEY_CACHE[member_id] = detected
 
         match: Optional[bool] = None
-        expected_num: Optional[int] = None
         if expected_digits:
             try:
                 expected_num = int(expected_digits)
@@ -224,18 +219,14 @@ async def send_img(
             except Exception:
                 match = None
 
-        took_ms = round((time.perf_counter() - t0) * 1000.0, 1)
-
-        # ── 5) 정상 응답
+        # ── 5) 정상 응답 (백엔드 포맷)
         step = "done"
         return {
-            "status": "ok",
-            "detectedNumber": detected,
+            "status": 200,
+            "success": True,
+            "backNumber": detected,
             "confidence": conf,
-            "expectedNumber": expected_num,
             "match": match,
-            "memberId": member_id,
-            "tookMs": took_ms,
         }
 
     except Exception as e:
@@ -244,6 +235,7 @@ async def send_img(
             status_code=status.HTTP_400_BAD_REQUEST,
             content={"status": "error", "step": step, "message": str(e), "memberId": member_id},
         )
+
 
 # ─────────────── 2) 세그먼트 검출 (번호는 캐시에서) ───────────────
 @router.post("/segments", summary="Detect Segments")
