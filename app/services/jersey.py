@@ -19,6 +19,51 @@ from app.services.ffmpeg import get_duration
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────
+# CUDA helpers (선택적 가속)
+# ─────────────────────────────────────
+def _cuda_available() -> bool:
+    """OpenCV가 CUDA 빌드이고 USE_CUDA=true이면 True."""
+    try:
+        return bool(settings.USE_CUDA) and cv2.cuda.getCudaEnabledDeviceCount() > 0
+    except Exception:
+        return False
+
+def _fast_resize(img: np.ndarray, fx: float, fy: float) -> np.ndarray:
+    """CUDA 가능하면 GPU resize, 아니면 CPU resize."""
+    if fx == 1.0 and fy == 1.0:
+        return img
+    if _cuda_available():
+        try:
+            gpu = cv2.cuda_GpuMat()
+            gpu.upload(img)
+            new_w = int(round(img.shape[1] * fx))
+            new_h = int(round(img.shape[0] * fy))
+            gpu_resized = cv2.cuda.resize(gpu, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+            return gpu_resized.download()
+        except Exception:
+            # GPU 경로 실패 시 CPU 폴백
+            pass
+    return cv2.resize(img, None, fx=fx, fy=fy, interpolation=cv2.INTER_CUBIC)
+
+def _maybe_downscale_for_cuda(bgr: np.ndarray) -> np.ndarray:
+    """
+    이미지가 너무 크면 긴 변 기준으로 CUDA_RESIZE_MAX에 맞추어 미리 축소.
+    CPU 경로에서도 과도한 메모리/시간을 줄이는 효과.
+    """
+    try:
+        max_side = int(getattr(settings, "CUDA_RESIZE_MAX", 1920))
+        if max_side <= 0:
+            return bgr
+        h, w = bgr.shape[:2]
+        long_side = max(h, w)
+        if long_side > max_side:
+            scale = max_side / float(long_side)
+            return _fast_resize(bgr, scale, scale)
+    except Exception:
+        pass
+    return bgr
+
+# ─────────────────────────────────────
 # FFmpeg helpers (타임아웃/로깅 포함)
 # ─────────────────────────────────────
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -42,34 +87,35 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
         logger.exception(f"[jersey.ffproc] failed: {e}")
         raise
 
-
 # ─────────────────────────────────────
 # 프레임 샘플링 (세그먼트 검출에서 사용)
 # ─────────────────────────────────────
 def _sample_frames_to_dir(video_path: Path, fps: float) -> tuple[Path, list[tuple[float, Path]]]:
     """
     ffmpeg로 일정 fps 간격 프레임을 추출하고 showinfo 로그에서 pts_time(초)을 파싱.
-    반환: (임시폴더경로, [(timestamp_sec, frame_path), ...])
+    (옵션) settings.FFMPEG_HWACCEL,* 설정 시 하드웨어 가속 디코딩 사용.
     """
     assert video_path.exists(), f"input not found: {video_path}"
     tmp_dir = Path(tempfile.mkdtemp(prefix="jersey_"))
     out_pattern = tmp_dir / "f_%05d.jpg"
-    # 960px로 스케일 제한(속도/인식 안정성), showinfo로 타임스탬프 얻기
+
     vf = f"fps={fps},scale='min(960,iw)':-2,showinfo"
 
-    proc = _run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(video_path),
-            "-vf",
-            vf,
-            "-q:v",
-            "3",
-            str(out_pattern),
-        ]
-    )
+    cmd = ["ffmpeg", "-y"]
+    # 하드웨어 가속(옵션) — config의 FFMPEG_HWACCEL / FFMPEG_HWACCEL_DEVICE 사용
+    if getattr(settings, "FFMPEG_HWACCEL", ""):
+        cmd += ["-hwaccel", settings.FFMPEG_HWACCEL]
+        if getattr(settings, "FFMPEG_HWACCEL_DEVICE", ""):
+            cmd += ["-hwaccel_device", settings.FFMPEG_HWACCEL_DEVICE]
+
+    cmd += [
+        "-i", str(video_path),
+        "-vf", vf,
+        "-q:v", "3",
+        str(out_pattern),
+    ]
+
+    proc = _run(cmd)
 
     times: list[float] = []
     for line in (proc.stderr or "").splitlines():
@@ -88,7 +134,6 @@ def _sample_frames_to_dir(video_path: Path, fps: float) -> tuple[Path, list[tupl
 
     logger.info(f"[jersey.sample] frames={len(pairs)} (fps={fps})")
     return tmp_dir, pairs
-
 
 # ─────────────────────────────────────
 # ROI 탐색(숫자 후보)
@@ -129,7 +174,6 @@ def _digit_roi_candidates(gray: np.ndarray) -> list[np.ndarray]:
         rois.append(roi)
     return rois
 
-
 # ─────────────────────────────────────
 # OCR 유틸 (강화 루틴)
 # ─────────────────────────────────────
@@ -147,7 +191,6 @@ def _final_conf(digits: str, conf_vals: list[float]) -> float:
     if n == 2:
         return 0.90
     return 0.80
-
 
 def _tess_digits_with_conf(img: np.ndarray, psm: int) -> tuple[str, float]:
     """
@@ -192,7 +235,6 @@ def _tess_digits_with_conf(img: np.ndarray, psm: int) -> tuple[str, float]:
     conf = _final_conf(digits, conf_vals)
     return digits, conf
 
-
 def _prep_variants(bgr: np.ndarray, invert: bool) -> list[np.ndarray]:
     """
     다양한 전처리 변형: 그레이, CLAHE, Otsu, Adaptive, Morph
@@ -224,7 +266,6 @@ def _prep_variants(bgr: np.ndarray, invert: bool) -> list[np.ndarray]:
 
     return outs
 
-
 def _best_digits_with_hint(digs: list[tuple[str, float]], expected: str | None) -> tuple[str, float]:
     if not digs:
         return "", 0.0
@@ -240,13 +281,15 @@ def _best_digits_with_hint(digs: list[tuple[str, float]], expected: str | None) 
     digs = sorted(digs, key=lambda x: (len(x[0]), x[1]), reverse=True)
     return digs[0]
 
-
 def _ocr_try_all(bgr: np.ndarray, expected: str | None = None) -> tuple[str, float, Dict[str, Any]]:
     """
     멀티 스케일 × 반전 × 전처리 × PSM 조합으로 최적 결과 탐색.
     - 예산(콤보 수/총 소요시간) 초과 시 즉시 중단
     - 힌트(expected)와 정확히 일치하면 즉시 단락(short-circuit)
     """
+    # 너무 크면 미리 축소(속도/메모리)
+    bgr = _maybe_downscale_for_cuda(bgr)
+
     H, W = bgr.shape[:2]
     tried = 0
     candidates: list[tuple[str, float]] = []
@@ -264,7 +307,7 @@ def _ocr_try_all(bgr: np.ndarray, expected: str | None = None) -> tuple[str, flo
         return (tried >= max_combos) or ((time.perf_counter() - t0) >= max_sec)
 
     for s in scales:
-        scaled = cv2.resize(bgr, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC) if s != 1.0 else bgr
+        scaled = _fast_resize(bgr, s, s) if s != 1.0 else bgr
         for inv in invert_opts:
             variants = _prep_variants(scaled, invert=inv)
 
@@ -299,7 +342,7 @@ def _ocr_try_all(bgr: np.ndarray, expected: str | None = None) -> tuple[str, flo
             rois = _digit_roi_candidates(gray)
             for roi in rois:
                 for fx in (1.5, 2.0, 3.0):
-                    roi_big = cv2.resize(roi, None, fx=fx, fy=fx, interpolation=cv2.INTER_CUBIC)
+                    roi_big = _fast_resize(roi, fx, fx)
                     for psm in psms:
                         tried += 1
                         digs, cf = _tess_digits_with_conf(roi_big, psm=psm)
@@ -331,7 +374,6 @@ def _ocr_try_all(bgr: np.ndarray, expected: str | None = None) -> tuple[str, flo
         debug["topCandidates"] = [{"digits": d, "conf": round(c, 3)} for d, c in top]
     return digits, float(conf), debug
 
-
 # ✅ 힌트 지원 공개 API (라우터에서 backNumber 힌트 사용)
 def ocr_jersey_image_bytes_with_hint(image_bytes: bytes, expected: str | None) -> tuple[str, float]:
     if not image_bytes:
@@ -340,9 +382,9 @@ def ocr_jersey_image_bytes_with_hint(image_bytes: bytes, expected: str | None) -
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if bgr is None:
         return "", 0.0
+    bgr = _maybe_downscale_for_cuda(bgr)
     digits, conf, _ = _ocr_try_all(bgr, expected=expected)
     return digits, conf
-
 
 # ─────────────────────────────────────
 # 공개 OCR API
@@ -359,10 +401,9 @@ def ocr_jersey_image_bytes(image_bytes: bytes) -> tuple[str, float]:
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if bgr is None:
         return "", 0.0
-
+    bgr = _maybe_downscale_for_cuda(bgr)
     digits, conf, _dbg = _ocr_try_all(bgr)
     return digits, conf
-
 
 def ocr_jersey_image_bytes_debug(image_bytes: bytes) -> tuple[str, float, Dict[str, Any]]:
     """
@@ -375,8 +416,8 @@ def ocr_jersey_image_bytes_debug(image_bytes: bytes) -> tuple[str, float, Dict[s
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if bgr is None:
         return "", 0.0, {"reason": "decode_failed"}
+    bgr = _maybe_downscale_for_cuda(bgr)
     return _ocr_try_all(bgr)
-
 
 # ─────────────────────────────────────
 # time utils
@@ -397,7 +438,6 @@ def _merge_times(times: list[float], max_gap: float) -> list[tuple[float, float]
     segs.append((s, e))
     return segs
 
-
 def _expand_and_filter(
     segs: list[tuple[float, float]],
     pad: float,
@@ -412,7 +452,6 @@ def _expand_and_filter(
         if e2 - s2 >= min_dur:
             out.append((s2, e2))
     return out
-
 
 # ─────────────────────────────────────
 # main API: 세그먼트 검출
@@ -454,7 +493,7 @@ def detect_player_segments(
             fast_psms = settings.OCR_PSMS or [7, 6, 10]
             for roi in rois:
                 for fx in (2.0, 3.0):
-                    roi_big = cv2.resize(roi, None, fx=fx, fy=fx, interpolation=cv2.INTER_LINEAR)
+                    roi_big = _fast_resize(roi, fx, fx)
                     for psm in fast_psms:
                         digs, cf = _tess_digits_with_conf(roi_big, psm=psm)
                         digs = re.sub(r"\D+", "", digs)
@@ -468,7 +507,8 @@ def detect_player_segments(
 
             # ROI에서 못 찾으면, 이미지 전체를 보조 탐색(예산 내)
             if not found:
-                digits, cf, _ = _ocr_try_all(img, expected=target)
+                img_small = _maybe_downscale_for_cuda(img)
+                digits, cf, _ = _ocr_try_all(img_small, expected=target)
                 if digits and target in digits and cf >= num_conf:
                     found = True
 

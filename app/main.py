@@ -12,6 +12,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from app.core.config import settings
 from app.core.logging import setup_logging
 from app.routers import upload, highlight, player, frames
+from app.routers import presigned_upload, process
 
 # ─────────────────────────────────────────────────────────────
 # 로깅 초기화
@@ -112,3 +113,5 @@ app.include_router(upload.router)
 app.include_router(highlight.router)
 app.include_router(player.router)
 app.include_router(frames.router)
+app.include_router(presigned_upload.router)
+app.include_router(process.router)

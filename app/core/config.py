@@ -38,7 +38,6 @@ def _getenv_ints(key: str, default: str) -> list[int]:
             pass
     return out
 
-
 class Settings(BaseModel):
     # ── 기본 컷 길이/최대 클립 수 ──────────────────────────────
     DEFAULT_PRE: float = float(os.getenv("DEFAULT_PRE", "5.0"))
@@ -71,25 +70,22 @@ class Settings(BaseModel):
     DEBUG_OCR: bool = _getenv_bool("DEBUG_OCR", True)
     # Tesseract 호출 타임아웃(초)
     OCR_TIMEOUT_SEC: int = int(os.getenv("OCR_TIMEOUT_SEC", "30"))
-    # OCR 조합/시간 예산(미지정 시 jersey.py에서 기본값으로 동작)
+    # OCR 조합/시간 예산
     OCR_MAX_COMBOS: int = int(os.getenv("OCR_MAX_COMBOS", "120"))
     OCR_MAX_SEC: float = float(os.getenv("OCR_MAX_SEC", "8.0"))
 
     # ── 실행/로깅/안정화 ─────────────────────────────────────
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")                           # DEBUG/INFO/WARNING/ERROR
     REQUEST_LOG_BODY: bool = _getenv_bool("REQUEST_LOG_BODY", False)          # 대용량 업로드 고려 시 기본 False
-
     # 서브프로세스(FFmpeg 등) 타임아웃(초)
     FFMPEG_TIMEOUT_SEC: int = int(os.getenv("FFMPEG_TIMEOUT_SEC", "120"))
-
     # 업로드 최대 크기(바이트). 0 또는 미설정이면 제한 없음 (기본 200MB)
     MAX_UPLOAD_BYTES: int = int(os.getenv("MAX_UPLOAD_BYTES", "209715200"))
 
     # ── FFmpeg 하드웨어 디코드(옵션) ─────────────────────────
-    # 예: FFMPEG_HWACCEL=cuda / vaapi / qsv … (미설정이면 소프트웨어 디코드)
-    FFMPEG_HWACCEL: str = os.getenv("FFMPEG_HWACCEL", "").strip().lower()
-    # 특정 디바이스 인덱스가 필요하면 설정(예: 0)
-    FFMPEG_HWACCEL_DEVICE: str = os.getenv("FFMPEG_HWACCEL_DEVICE", "").strip()
+    # ✅ 두 이름 모두 지원: FF_HWACCEL(신규) 또는 FFMPEG_HWACCEL(기존)
+    FF_HWACCEL: str = (os.getenv("FF_HWACCEL", "") or os.getenv("FFMPEG_HWACCEL", "")).strip().lower()
+    FF_HWACCEL_DEVICE: str = (os.getenv("FF_HWACCEL_DEVICE", "") or os.getenv("FFMPEG_HWACCEL_DEVICE", "")).strip()
 
     # ── OpenCV CUDA 사용 옵션(옵션) ──────────────────────────
     # OpenCV가 CUDA로 빌드되어 있고 GPU가 있으면 True로 활성화, 아니면 자동 폴백
