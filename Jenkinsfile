@@ -2,7 +2,7 @@ pipeline {
     agent any
 
     environment {
-        WORKDIR = '/home/ubuntu/fastapi-app'        // FastAPI 프로젝트 경로
+        WORKDIR = '/var/jenkins_home/workspace/fastapi-app'        // FastAPI 프로젝트 경로
         COMPOSE_SERVICE = 'fast-api'                // docker-compose 서비스명
         IMAGE_NAME = 'fastapi-app:latest'
     }
