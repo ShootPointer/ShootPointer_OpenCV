@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Tuple
 import io
+import os
 import uuid
 import zipfile
 import logging
@@ -86,7 +87,7 @@ def generate_highlight_clips(
 
     for t in ts:
         s, e = _safe_window(total, t, pre, post)
-        # 사람이 보기 좋은 파일명: 접두사 + 중심초(정수) + 랜덤 id
+        # 사람이 보기 좋은 임시파일명: 접두사 + 중심초(정수) + 랜덤 id (임시 디렉터리)
         name = f"{prefix}{int(round(t))}_{uuid.uuid4().hex[:8]}.mp4"
         dst = TMP_CLIPS / name
 
@@ -131,3 +132,36 @@ def auto_candidates(src: Path, topk: int | None = None) -> List[float]:
     centers = non_silent_centers(total, sil, topk=k)
     logger.info(f"[pipeline.auto] candidates={centers}")
     return centers
+
+
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def save_clip_to_repo(src_path: Path, member_id: str, job_id: str, index: int) -> tuple[Path, str]:
+    """
+    src_path(임시 클립)를 서비스 저장소(SAVE_ROOT)로 이동/복사하고, 공개 URL을 만들어 반환.
+    - 최종 파일명은 index 대신 UUID로 부여(요구사항 반영).
+    return: (dst_path, public_url)
+    """
+    root = Path(settings.SAVE_ROOT)
+    dst_dir = root / member_id / job_id
+    ensure_dir(dst_dir)
+
+    # 🔁 변경 포인트: 최종 파일명은 uuid 기반으로 생성
+    #   - 하이픈 없는 32자 hex 사용 (경로/호환성 안전)
+    uuid_name = f"{uuid.uuid4().hex}{src_path.suffix}"
+    dst_path = dst_dir / uuid_name
+
+    # 이동(같은 볼륨이면 rename으로 빠르게), 다르면 copy 후 원본 삭제
+    try:
+        src_path.rename(dst_path)
+    except Exception:
+        dst_path.write_bytes(src_path.read_bytes())
+        try:
+            src_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    public_url = f"{settings.STATIC_BASE_URL.rstrip('/')}/{member_id}/{job_id}/{dst_path.name}"
+    return dst_path, public_url

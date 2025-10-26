@@ -103,4 +103,21 @@ class Settings(BaseModel):
     CALLBACK_READ_TIMEOUT: float = float(os.getenv("CALLBACK_READ_TIMEOUT", "60"))
     CALLBACK_WRITE_TIMEOUT: float = float(os.getenv("CALLBACK_WRITE_TIMEOUT", "60"))
 
+    # ─────────────────────────────────────────────────────────
+    # ⬇⬇⬇ 이번 단계에 필요한 추가 설정만 최소로 보강 ⬇⬇⬇
+    # ─────────────────────────────────────────────────────────
+    # 파일 저장 루트 (컨테이너 내부 경로) - 예: /data/highlights
+    SAVE_ROOT: str = os.getenv("SAVE_ROOT", "/data/highlights")
+    # 외부에서 접근할 정적 URL 베이스 - 예: https://your-domain/static/highlights
+    STATIC_BASE_URL: str = os.getenv("STATIC_BASE_URL", "https://your-domain/static/highlights")
+    # Redis 연결 URL - 예: redis://redis:6379/0
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://redis:6379/0")
+
+    # 결과를 Redis Key/Value로 저장할지 여부 (백엔드가 GET으로 즉시 조회 가능)
+    PUBLISH_RESULT_AS_KV: bool = _getenv_bool("PUBLISH_RESULT_AS_KV", True)
+    # 결과 Key 프리픽스: highlight-{jobId}
+    RESULT_KEY_PREFIX: str = os.getenv("RESULT_KEY_PREFIX", "highlight-")
+    # 결과 Key TTL(초). 0 이하면 만료 없음. 운영에선 1일(86400) 권장.
+    RESULT_TTL_SECONDS: int = int(os.getenv("RESULT_TTL_SECONDS", "86400"))
+
 settings = Settings()

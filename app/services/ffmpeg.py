@@ -16,28 +16,28 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────
 def _inject_hwaccel(cmd: list[str]) -> list[str]:
     """
-    settings.FFMPEG_HWACCEL / FFMPEG_HWACCEL_DEVICE 가 설정되면 -hwaccel 옵션 삽입.
+    settings.FF_HWACCEL / FF_HWACCEL_DEVICE 설정 시 -hwaccel 옵션 삽입.
     ["ffmpeg" | "ffprobe", ...] 형태의 커맨드만 대응.
     """
-    if not getattr(settings, "FFMPEG_HWACCEL", None):
+    hw = getattr(settings, "FF_HWACCEL", "") or ""
+    dev = getattr(settings, "FF_HWACCEL_DEVICE", "") or ""
+    if not hw or not cmd:
         return cmd
-    if not cmd:
-        return cmd
+
     tool = cmd[0]
     rest = cmd[1:]
-    injected = [tool, "-hwaccel", settings.FFMPEG_HWACCEL]
-    if getattr(settings, "FFMPEG_HWACCEL_DEVICE", None):
-        injected += ["-hwaccel_device", settings.FFMPEG_HWACCEL_DEVICE]
+    injected = [tool, "-hwaccel", hw]
+    if dev:
+        injected += ["-hwaccel_device", dev]
     injected += rest
     return injected
 
 
-def _run(cmd: list[str], timeout: int | None = None) -> subprocess.CompletedProcess:
+def _run(cmd: list[str], timeout: Optional[int] = None) -> subprocess.CompletedProcess:
     """
     공통 서브프로세스 실행.
     - stdout/stderr 캡처
     - settings.FFMPEG_TIMEOUT_SEC 기본 적용
-    - 예외: TimeoutExpired는 상위로 전파, 기타 예외는 로깅 후 전파
     """
     to = timeout if timeout is not None else settings.FFMPEG_TIMEOUT_SEC
     cmd = _inject_hwaccel(cmd)
@@ -80,7 +80,7 @@ def get_duration(video_path: Path) -> float:
         data = json.loads(p.stdout or "{}")
         dur = float(data.get("format", {}).get("duration", 0.0))
     except Exception:
-        # 드물게 ffprobe가 stdout을 비우는 경우가 있어, stderr에서 수치 힌트를 보조 파싱
+        # stdout 누락 시 stderr에서 보조 파싱
         m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", p.stderr or "")
         if m:
             h, mi, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
@@ -125,7 +125,7 @@ def cut_clip_fast(src: Path, dst: Path, start: float, end: float) -> None:
     """
     빠른 컷팅(키프레임 단위) - 코덱 copy.
     start~end 구간을 잘라 dst로 저장.
-    - 실패 시(키프레임 제약, 컨테이너 이슈 등) .env의 FFMPEG_CUT_FALLBACK_REENCODE=1 인 경우 재인코드 폴백 수행
+    - 실패 시(키프레임 제약, 컨테이너 이슈 등) .env 의 FFMPEG_CUT_FALLBACK_REENCODE=1 인 경우 재인코드 폴백 수행
     """
     assert src.exists(), f"not found: {src}"
     duration = max(0.0, end - start)

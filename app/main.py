@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import logging
 import time
+from urllib.parse import urlparse
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -25,6 +29,17 @@ logger = logging.getLogger("app")
 # ─────────────────────────────────────────────────────────────
 app = FastAPI(title="Basket Highlight AI", version="0.6.0")
 
+# ─────────────────────────────────────────────────────────────
+# CORS (settings.ALLOW_ORIGINS 사용)
+# ─────────────────────────────────────────────────────────────
+allow_origins = [o.strip() for o in settings.ALLOW_ORIGINS.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins or ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ─────────────────────────────────────────────────────────────
 # 미들웨어: 요청/응답 로깅
@@ -55,7 +70,6 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
                 content={"error": "internal_server_error", "detail": str(e)},
             )
 
-
 # ─────────────────────────────────────────────────────────────
 # 미들웨어: 업로드 용량 제한 (Content-Length 기반)
 #   - .env의 MAX_UPLOAD_BYTES 초과 시 413 반환
@@ -78,10 +92,23 @@ class UploadLimitMiddleware(BaseHTTPMiddleware):
 
         return await call_next(request)
 
-
 app.add_middleware(RequestLogMiddleware)
 app.add_middleware(UploadLimitMiddleware)
 
+# ─────────────────────────────────────────────────────────────
+# 정적 파일 서빙 마운트
+#   - STATIC_BASE_URL의 path 부분을 FastAPI에 마운트
+#   - 예: STATIC_BASE_URL = http://localhost:8000/static/highlights
+#         → path = "/static/highlights" 를 SAVE_ROOT에 매핑
+#   - 운영에서 Nginx로 서빙할 때도 개발 편의를 위해 두어도 무방
+# ─────────────────────────────────────────────────────────────
+parsed = urlparse(settings.STATIC_BASE_URL)
+static_path = parsed.path or "/static/highlights"
+app.mount(
+    static_path,
+    StaticFiles(directory=settings.SAVE_ROOT, html=False),
+    name="static-highlights",
+)
 
 # ─────────────────────────────────────────────────────────────
 # 전역 예외 핸들러
@@ -91,12 +118,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     logger.warning(f"Validation error {request.url.path}: {exc.errors()}")
     return JSONResponse(status_code=422, content={"error": "validation_error", "detail": exc.errors()})
 
-
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     logger.warning(f"HTTP error {request.url.path}: {exc.detail}")
     return JSONResponse(status_code=exc.status_code, content={"error": "http_error", "detail": exc.detail})
-
 
 # ─────────────────────────────────────────────────────────────
 # 헬스체크
@@ -104,7 +129,6 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
 
 # ─────────────────────────────────────────────────────────────
 # 라우터 등록
