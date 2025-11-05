@@ -1,7 +1,7 @@
 services:
   fast-api:
     build: .
-    container_name: fast-api
+    # container_name: fast-api
     ports:
       - "8000:8000"   # FastAPI는 외부 8000 유지
     env_file:
@@ -37,7 +37,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: redis
+    # container_name: redis
     # ❌ 호스트 포트 노출 제거 (6379 충돌 방지)
     # ports:
     #   - "6379:6379"
