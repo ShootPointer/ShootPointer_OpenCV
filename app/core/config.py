@@ -38,6 +38,7 @@ def _getenv_ints(key: str, default: str) -> list[int]:
             pass
     return out
 
+
 class Settings(BaseModel):
     # ── 기본 컷 길이/최대 클립 수 ──────────────────────────────
     DEFAULT_PRE: float = float(os.getenv("DEFAULT_PRE", "5.0"))
@@ -76,7 +77,7 @@ class Settings(BaseModel):
 
     # ── 실행/로깅/안정화 ─────────────────────────────────────
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")                           # DEBUG/INFO/WARNING/ERROR
-    REQUEST_LOG_BODY: bool = _getenv_bool("REQUEST_LOG_BODY", False)          # 대용량 업로드 고려 시 기본 False
+    REQUEST_LOG_BODY: bool = _getenv_bool("REQUEST_LOG_BODY", False)          # 대용량 업로드 대비 False 권장
     # 서브프로세스(FFmpeg 등) 타임아웃(초)
     FFMPEG_TIMEOUT_SEC: int = int(os.getenv("FFMPEG_TIMEOUT_SEC", "120"))
     # 업로드 최대 크기(바이트). 0 또는 미설정이면 제한 없음 (기본 200MB)
@@ -104,7 +105,7 @@ class Settings(BaseModel):
     CALLBACK_WRITE_TIMEOUT: float = float(os.getenv("CALLBACK_WRITE_TIMEOUT", "60"))
 
     # ─────────────────────────────────────────────────────────
-    # ⬇⬇⬇ 이번 단계에 필요한 추가 설정만 최소로 보강 ⬇⬇⬇
+    # ⬇⬇⬇ 이번 단계에 필요한 추가 설정(보강) ⬇⬇⬇
     # ─────────────────────────────────────────────────────────
     # 파일 저장 루트 (컨테이너 내부 경로) - 예: /data/highlights
     SAVE_ROOT: str = os.getenv("SAVE_ROOT", "/data/highlights")
@@ -119,5 +120,30 @@ class Settings(BaseModel):
     RESULT_KEY_PREFIX: str = os.getenv("RESULT_KEY_PREFIX", "highlight-")
     # 결과 Key TTL(초). 0 이하면 만료 없음. 운영에선 1일(86400) 권장.
     RESULT_TTL_SECONDS: int = int(os.getenv("RESULT_TTL_SECONDS", "86400"))
+
+    # ── (신규) FFmpeg 오버레이/출력 튜닝 ───────────────────────
+    # Shorts 세로 해상도 (bh_edit에서 drawtext/scale용) — 코드 기본값은 1080x1920
+    SHORTS_WIDTH: int = int(os.getenv("SHORTS_WIDTH", "1080"))
+    SHORTS_HEIGHT: int = int(os.getenv("SHORTS_HEIGHT", "1920"))
+    # Windows 등 폰트 경로 지정(미지정 시 시스템 기본 폰트 사용 시도)
+    DRAW_FONTFILE: str = os.getenv("DRAW_FONTFILE", "")
+    DRAW_FONTSIZE: int = int(os.getenv("DRAW_FONTSIZE", "48"))
+    # FFmpeg 인코딩 품질/속도
+    FFMPEG_PRESET: str = os.getenv("FFMPEG_PRESET", "veryfast")
+    FFMPEG_CRF: int = int(os.getenv("FFMPEG_CRF", "20"))
+    FFMPEG_ABR: str = os.getenv("FFMPEG_ABR", "128k")
+
+    # ── (신규) 배치/탐지 튜닝(코드 수정 없이 환경으로 미세조정) ─────────
+    # 다운스케일 기준(긴 변 / SCALE_BASE). 기본 960 → 값 낮추면 속도↑, 높이면 정확도↑
+    SCALE_BASE: int = int(os.getenv("SCALE_BASE", "960"))
+    # 공 HSV 범위(오렌지 계열). "Hmin,Smin,Vmin" / "Hmax,Smax,Vmax"
+    BALL_HSV_MIN: str = os.getenv("BALL_HSV_MIN", "5,60,60")
+    BALL_HSV_MAX: str = os.getenv("BALL_HSV_MAX", "25,255,255")
+    # HoughLinesP 파라미터(코트 라인)
+    HOUGH_MIN_LINE_RATIO: float = float(os.getenv("HOUGH_MIN_LINE_RATIO", "0.25"))  # minLineLength = ratio * width
+    HOUGH_MAX_GAP: int = int(os.getenv("HOUGH_MAX_GAP", "20"))
+    HOUGH_THRESH: int = int(os.getenv("HOUGH_THRESH", "120"))
+    # Homography(RANSAC) 허용 오차
+    HOMO_RANSAC_REPROJ_THRESH: float = float(os.getenv("HOMO_RANSAC_REPROJ_THRESH", "3.0"))
 
 settings = Settings()
