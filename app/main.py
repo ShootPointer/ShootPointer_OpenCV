@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import logging
 import time
+import os
+import shutil
+import subprocess
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request
@@ -17,7 +20,7 @@ from app.core.config import settings
 from app.core.logging import setup_logging
 from app.routers import upload, highlight, player, frames
 from app.routers import presigned_upload, process
-from app.routers import ai_demo  # ✅ 추가: 데모 하이라이트 라우터
+from app.routers import ai_demo  # ✅ 데모 하이라이트 라우터
 
 # ─────────────────────────────────────────────────────────────
 # 로깅 초기화
@@ -97,6 +100,62 @@ app.add_middleware(RequestLogMiddleware)
 app.add_middleware(UploadLimitMiddleware)
 
 # ─────────────────────────────────────────────────────────────
+# 유틸: 실행파일 버전 확인/존재 확인
+# ─────────────────────────────────────────────────────────────
+def _which(cmd: str) -> str | None:
+    return shutil.which(cmd)
+
+def _run_out(args: list[str]) -> tuple[bool, str]:
+    try:
+        out = subprocess.check_output(args, stderr=subprocess.STDOUT, timeout=5).decode("utf-8", errors="ignore").strip()
+        return True, out
+    except Exception as e:
+        return False, str(e)
+
+def _check_ff_binaries() -> dict:
+    ok_ffmpeg = _which("ffmpeg") is not None
+    ok_ffprobe = _which("ffprobe") is not None
+    ffmpeg_ver = _run_out(["ffmpeg", "-version"])[1] if ok_ffmpeg else "not found"
+    ffprobe_ver = _run_out(["ffprobe", "-version"])[1] if ok_ffprobe else "not found"
+    return {
+        "ffmpeg_found": ok_ffmpeg,
+        "ffprobe_found": ok_ffprobe,
+        "ffmpeg_version": ffmpeg_ver.splitlines()[0] if isinstance(ffmpeg_ver, str) else ffmpeg_ver,
+        "ffprobe_version": ffprobe_ver.splitlines()[0] if isinstance(ffprobe_ver, str) else ffprobe_ver,
+    }
+
+def _check_font() -> dict:
+    font = os.getenv("DRAW_FONTFILE") or "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    exists = os.path.exists(font)
+    return {"font_path": font, "exists": exists}
+
+def _check_save_root() -> dict:
+    root = settings.SAVE_ROOT
+    ok_path = True
+    ok_write = True
+    msg = "ok"
+    try:
+        os.makedirs(root, exist_ok=True)
+        test_path = os.path.join(root, ".write_test")
+        with open(test_path, "w") as f:
+            f.write("ok")
+        os.remove(test_path)
+    except Exception as e:
+        ok_write = False
+        msg = str(e)
+    if not os.path.isdir(root):
+        ok_path = False
+        msg = f"not a directory: {root}"
+    return {"save_root": root, "dir_ok": ok_path, "writable": ok_write, "detail": msg}
+
+def _check_static_mount() -> dict:
+    parsed = urlparse(settings.STATIC_BASE_URL)
+    return {
+        "STATIC_BASE_URL": settings.STATIC_BASE_URL,
+        "mount_path": parsed.path or "/static/highlights"
+    }
+
+# ─────────────────────────────────────────────────────────────
 # 정적 파일 서빙 마운트
 #   - STATIC_BASE_URL의 path를 FastAPI에 매핑
 #   - 예: STATIC_BASE_URL = "http://tkv0011.ddns.net:8000/static/highlights"
@@ -110,6 +169,53 @@ app.mount(
     StaticFiles(directory=settings.SAVE_ROOT, html=False),
     name="static-highlights",
 )
+
+# ─────────────────────────────────────────────────────────────
+# 스타트업 셀프체크: 환경 차이로 인한 실패 예방
+# ─────────────────────────────────────────────────────────────
+@app.on_event("startup")
+async def _startup_selfcheck():
+    env_summary = {
+        "LOG_LEVEL": settings.LOG_LEVEL,
+        "SAVE_ROOT": settings.SAVE_ROOT,
+        "STATIC_BASE_URL": settings.STATIC_BASE_URL,
+        "ALLOW_ORIGINS": settings.ALLOW_ORIGINS,
+        "MAX_UPLOAD_BYTES": settings.MAX_UPLOAD_BYTES,
+        "FFMPEG_TIMEOUT_SEC": settings.FFMPEG_TIMEOUT_SEC,
+    }
+    logger.info(f"[startup] ENV: {env_summary}")
+
+    ff = _check_ff_binaries()
+    font = _check_font()
+    sr = _check_save_root()
+    st = _check_static_mount()
+
+    logger.info(f"[startup] ffmpeg/ffprobe: {ff}")
+    logger.info(f"[startup] font: {font}")
+    logger.info(f"[startup] static mount: {st}")
+    if not sr["dir_ok"] or not sr["writable"]:
+        logger.error(f"[startup] SAVE_ROOT not writable: {sr}")
+    else:
+        logger.info(f"[startup] SAVE_ROOT OK: {sr}")
+
+# (선택) 수동 점검용 엔드포인트
+@app.get("/debug/selfcheck")
+def debug_selfcheck():
+    return {
+        "env": {
+            "LOG_LEVEL": settings.LOG_LEVEL,
+            "SAVE_ROOT": settings.SAVE_ROOT,
+            "STATIC_BASE_URL": settings.STATIC_BASE_URL,
+            "ALLOW_ORIGINS": settings.ALLOW_ORIGINS,
+            "MAX_UPLOAD_BYTES": settings.MAX_UPLOAD_BYTES,
+            "FFMPEG_TIMEOUT_SEC": settings.FFMPEG_TIMEOUT_SEC,
+        },
+        "ffmpeg": _check_ff_binaries(),
+        "font": _check_font(),
+        "save_root": _check_save_root(),
+        "static_mount": _check_static_mount(),
+        "status": "ok",
+    }
 
 # ─────────────────────────────────────────────────────────────
 # 전역 예외 핸들러
