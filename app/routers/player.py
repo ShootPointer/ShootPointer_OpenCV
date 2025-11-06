@@ -5,6 +5,7 @@ import logging
 import shutil
 import uuid
 import re
+import json
 import time
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
@@ -81,7 +82,8 @@ def _digits_only(s: Optional[str]) -> str:
 
 def _is_allowed_image_type(content_type: str | None) -> bool:
     return (content_type or "").lower() in {
-        "image/png", "image/jpeg", "image/jpg", "image/webp", "image/bmp"
+        "image/jpeg",
+        "image/jpg",
     }
 
 # ───────────────────── 1) 이미지 수신 & OCR ─────────────────────
@@ -91,6 +93,11 @@ async def send_img(
     image: UploadFile = File(..., alias="image", description="등번호가 보이는 이미지"),
     # ✅ 카멜식만 허용
     backNumber: str | None = Form(None, alias="backNumber", description="(선택) 기대 등번호(문자열 허용)"),
+    backNumberRequestDto: str | None = Form(
+        None,
+        alias="backNumberRequestDto",
+        description="(선택) 기대 등번호 JSON, 예:{'backNumber':10}",
+    ),
 ):
     """
     이미지에서 등번호를 OCR로 추출해 캐시에 저장.
@@ -106,7 +113,8 @@ async def send_img(
     # 입력 로깅(민감정보 제외) — camelCase만
     logger.info(
         f"[/send-img] member={member_id}, filename={image.filename}, "
-        f"content_type={image.content_type}, backNumber_raw={backNumber!r}"
+        f"content_type={image.content_type}, backNumber_raw={backNumber!r}, "
+        f"backNumberRequestDto_raw={backNumberRequestDto!r}"
     )
 
     try:
@@ -116,7 +124,7 @@ async def send_img(
             return JSONResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 content={"status": "error", "step": step,
-                         "message": f"지원하지 않는 이미지 타입입니다: {image.content_type}",
+                         "message": "지원하지 않는 이미지 타입입니다. JPEG만 지원합니다.",
                          "memberId": member_id},
             )
 
@@ -152,7 +160,7 @@ async def send_img(
                 content={"status": "error", "step": step, "message": "이미지 디코드 실패", "memberId": member_id},
             )
 
-        # ✅ 2-1) 너무 크면 리사이즈 후, PNG로 재인코딩하여 OCR 입력 바이트 교체
+        # ✅ 2-1) 너무 크면 리사이즈 후, JPEG로 재인코딩하여 OCR 입력 바이트 교체
         step = "resize_if_needed"
         try:
             shorter = min(W, H)
@@ -160,7 +168,11 @@ async def send_img(
                 scale = 1000.0 / float(shorter)
                 bgr = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
                 H, W = bgr.shape[:2]
-                ok, enc = cv2.imencode(".png", bgr)
+                ok, enc = cv2.imencode(
+                    ".jpg",
+                    bgr,
+                    [cv2.IMWRITE_JPEG_QUALITY, 90],
+                )
                 if not ok:
                     raise ValueError("리사이즈 후 인코딩 실패")
                 img_bytes = enc.tobytes()
@@ -184,7 +196,18 @@ async def send_img(
 
         # ── 3) OCR
         step = "ocr"
-        expected_digits = _digits_only(backNumber) if backNumber else ""
+        expected_digits = ""
+        if backNumberRequestDto:
+            try:
+                parsed = json.loads(backNumberRequestDto)
+                if isinstance(parsed, dict):
+                    candidate = parsed.get("backNumber")
+                    if candidate is not None:
+                        expected_digits = _digits_only(str(candidate))
+            except Exception as e:
+                logger.warning(f"[/send-img] backNumberRequestDto parse failed: {e}")
+        if not expected_digits and backNumber:
+            expected_digits = _digits_only(backNumber)
         try:
             # 힌트 기반 함수가 있으면 사용, 없으면 기본 함수 사용
             from app.services.jersey import ocr_jersey_image_bytes_with_hint  # type: ignore
