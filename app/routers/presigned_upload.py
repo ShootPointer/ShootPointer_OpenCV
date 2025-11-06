@@ -7,8 +7,9 @@ import uuid
 import tempfile
 import shutil
 import hashlib
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import anyio
 from fastapi import APIRouter, Request, Query, Header, Body
@@ -18,9 +19,9 @@ from app.core.config import settings
 from app.core.logging import logging
 from app.core.progress import ProgressBus, PROGRESS_TYPE
 from app.core.crypto import (
-    hmac_sha256_hex,                          # 기존 단일 업로드 서명 검증용(HEX)
-    verify_chunk_signature_b64url,            # 청크 PUT 검증(B64URL)
-    verify_complete_signature_b64url,         # 완료 POST 검증(B64URL)
+    hmac_sha256_hex,                          # (레거시 단일 업로드) HMAC-SHA256 HEX
+    verify_chunk_signature_b64url,            # presigned 청크 PUT 검증(Base64URL)
+    verify_complete_signature_b64url,         # presigned 완료 POST 검증(Base64URL)
 )
 from app.services.ffmpeg import get_duration  # 병합 후 길이 메타 계산
 
@@ -46,22 +47,34 @@ def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 def _ext_ok(name: str) -> bool:
-    # 🔒 허용 확장자만 통과 (필요하면 .env로 빼도 됨)
+    # 🔒 허용 확장자만 통과 (필요시 .env로 빼도 됨)
     allowed = {".mp4", ".mov", ".mkv", ".m4v"}
     return Path(name).suffix.lower() in allowed
+
+def _now_local_str() -> str:
+    """LocalDateTime ISO8601 (초) e.g., 2025-11-06T17:24:51"""
+    return datetime.now().isoformat(timespec="seconds")
+
+def _now_local_path() -> str:
+    """경로 안전(LocalDateTime) e.g., 2025-11-06T17-24-51"""
+    return datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 
 # 업로드 청크 최대 바이트 (없으면 무제한)
 _CHUNK_MAX_BYTES = int(getattr(settings, "UPLOAD_CHUNK_MAX_MB", 0) or 0) * 1024 * 1024
 
+
 # ─────────────────────────────────────────────────────────────
-# (A) 단일 업로드: PUT /api/upload  (네가 만든 기존 엔드포인트)
+# (A) 단일 업로드: PUT /api/upload  (레거시 – 유지)
+#     NOTE: 기존 클라이언트 호환을 위해 jobId를 그대로 받되,
+#           내부적으로는 highlightKey와 동일 개념으로 취급해도 무방.
+#           이 엔드포인트는 임시 파일만 받고 최종 저장은 하지 않음.
 # ─────────────────────────────────────────────────────────────
 @router.put("/upload", summary="Pre-signed 업로드 수신 (서명 검증 + 진행률 PUB)")
 async def upload_video(
     request: Request,
     expires: int = Query(..., description="만료 시각(ms since epoch)"),
     memberId: str = Query(..., description="멤버 식별자"),
-    jobId: str = Query(..., description="업로드/처리 작업 ID"),
+    jobId: str = Query(..., description="업로드/처리 작업 ID(레거시, highlightKey와 동일 개념)"),
     signature: str = Query(..., description="HMAC-SHA256 HEX(signature)"),
     fileName: str = Query(..., description="원본 파일명"),
 ):
@@ -72,11 +85,10 @@ async def upload_video(
     total_bytes = int(request.headers.get("content-length") or 0)
 
     try:
-        # 🔒 파일명 확장자 체크
         if not _ext_ok(fileName):
             return JSONResponse(status_code=415, content={"status": "error", "message": "unsupported media type"})
 
-        # 1) 형식/만료/서명 검증
+        # 1) 만료/서명 검증
         step = "verify_signature"
         if expires <= 0:
             return JSONResponse(status_code=422, content={"status": "error", "step": step, "message": "expires(ms) required"})
@@ -119,7 +131,6 @@ async def upload_video(
                 if not chunk:
                     continue
 
-                # 📏 per-request 크기 한도(단일 업로드에선 전체가 한 요청이므로 content-length로도 걸림)
                 recv_bytes += len(chunk)
                 await f.write(chunk)
 
@@ -141,7 +152,7 @@ async def upload_video(
                     except Exception as e:
                         logger.debug(f"[upload] progress publish skip: {e}")
 
-        # 끝난 직후 한 번 더 진행률 PUB(100% 보정)
+        # 종료 시 100% 보정
         try:
             await ProgressBus.publish_kv(
                 job_id=jobId,
@@ -158,10 +169,9 @@ async def upload_video(
 
         took_ms = round((time.perf_counter() - t0) * 1000.0, 1)
 
-        # 4) HTTP 응답
         return _ok({
             "type": "UPLOAD_SUCCESS",
-            "jobId": jobId,
+            "jobId": jobId,  # 레거시 호환
             "receivedBytes": recv_bytes,
             "totalBytes": total_bytes or None,
             "tookMs": took_ms,
@@ -185,7 +195,7 @@ async def upload_video(
 # ─────────────────────────────────────────────────────────────
 # (B) 청크 업로드: PUT /api/presigned/chunk
 #     쿼리: uploadId, partNumber, expires, signature(base64url)
-#     헤더: x-member-id, x-job-id, (옵션) x-content-sha256
+#     헤더: x-member-id, x-highlight-key, (옵션) x-content-sha256
 #     본문: 바이너리(이 파트 내용)
 # ─────────────────────────────────────────────────────────────
 UPLOAD_DIR = Path(getattr(settings, "UPLOAD_DIR", "/tmp/uploads"))
@@ -199,7 +209,7 @@ async def put_chunk(
     expires: str,
     signature: str,
     x_member_id: str = Header(..., alias="x-member-id"),
-    x_job_id: str = Header(..., alias="x-job-id"),
+    x_highlight_key: str = Header(..., alias="x-highlight-key"),
     x_content_sha256: str | None = Header(None, alias="x-content-sha256"),
 ):
     # 🔒 partNumber 검증
@@ -210,7 +220,7 @@ async def put_chunk(
     ok, reason = verify_chunk_signature_b64url(
         expires_ms=expires,
         member_id=x_member_id,
-        job_id=x_job_id,
+        job_id=x_highlight_key,   # 내부 검증 함수는 job_id 파라미터명을 쓰지만 값은 highlightKey
         upload_id=uploadId,
         part_number=partNumber,
         signature_b64url=signature,
@@ -236,7 +246,6 @@ async def put_chunk(
             if not chunk:
                 continue
             size += len(chunk)
-            # 📏 스트리밍 중 한도 초과 시 즉시 중단
             if _CHUNK_MAX_BYTES and size > _CHUNK_MAX_BYTES:
                 try: dst.unlink(missing_ok=True)
                 except: pass
@@ -261,7 +270,7 @@ async def put_chunk(
     # (옵션) 업로드 진행률 PUB — part 단위로 간단 표기
     try:
         await ProgressBus.publish_kv(
-            job_id=x_job_id,
+            job_id=x_highlight_key,   # 진행률 키 = highlightKey
             value={
                 "type": PROGRESS_TYPE.UPLOAD_PROGRESS,
                 "progress": None,  # 총합을 모르면 None
@@ -276,6 +285,7 @@ async def put_chunk(
     return _ok({
         "type": "UPLOADING",
         "uploadId": uploadId,
+        "highlightKey": x_highlight_key,
         "partNumber": int(partNumber),
         "receivedBytes": size,
         "message": "chunk stored",
@@ -286,11 +296,15 @@ async def put_chunk(
 # ─────────────────────────────────────────────────────────────
 # (C) 병합 완료: POST /api/presigned/complete
 #     헤더: x-upload-id, x-sig(Base64URL), x-expires(ms)
-#     바디: { memberId, jobId, fileName, totalBytes, parts:[...] }
-#     처리: /tmp/uploads/<uploadId>/part-*  →  /data/highlights/<member>/<job>/original_*.mp4
+#     바디: { memberId, highlightKey, fileName, totalBytes, parts:[...] }
+#     처리: /tmp/uploads/<uploadId>/part-*  →  /data/highlights/<member>/<highlightKey>/<LocalDateTime>/original_*.mp4
 #           + STATIC_BASE_URL 로 sourceUrl 구성, durationSec 포함
 # ─────────────────────────────────────────────────────────────
-def _merge_parts(upload_id: str, member_id: str, job_id: str, file_name: str) -> tuple[Path, int]:
+def _merge_parts(upload_id: str, member_id: str, highlight_key: str, file_name: str) -> Tuple[Path, int, str]:
+    """
+    청크를 병합해 최종 원본 파일로 저장.
+    return: (dst_path, total_size_bytes, ldt_path)
+    """
     base = UPLOAD_DIR / Path(upload_id).name    # 🔒 path traversal 방지
     if not base.exists():
         raise FileNotFoundError("no parts for uploadId")
@@ -310,12 +324,16 @@ def _merge_parts(upload_id: str, member_id: str, job_id: str, file_name: str) ->
         raise ValueError("unsupported media type")
 
     ext = Path(file_name).suffix or ".mp4"
-    out_dir = Path(settings.SAVE_ROOT) / member_id / job_id
-    _ensure_dir(out_dir)
-    out_path = out_dir / f"original_{uuid.uuid4().hex[:8]}{ext}"
+
+    # LocalDateTime 서브폴더
+    ldt_path = _now_local_path()  # 경로용 (YYYY-MM-DDTHH-MM-SS)
+    dst_dir = Path(settings.SAVE_ROOT) / member_id / highlight_key / ldt_path
+    _ensure_dir(dst_dir)
+
+    dst_path = dst_dir / f"original_{uuid.uuid4().hex[:8]}{ext}"
 
     total = 0
-    with out_path.open("wb") as w:
+    with dst_path.open("wb") as w:
         for p in parts:
             s = p.stat().st_size
             with p.open("rb") as r:
@@ -328,7 +346,8 @@ def _merge_parts(upload_id: str, member_id: str, job_id: str, file_name: str) ->
     except Exception:
         pass
 
-    return out_path, total
+    return dst_path, total, ldt_path
+
 
 @router.post("/presigned/complete", summary="Presigned 업로드 병합 완료 → sourceUrl 반환")
 async def post_complete(
@@ -337,19 +356,19 @@ async def post_complete(
     x_expires: str = Header(..., alias="x-expires"),
     payload: dict = Body(...),
 ):
-    member_id = str(payload.get("memberId", "")).strip()
-    job_id    = str(payload.get("jobId", "")).strip()
-    file_name = str(payload.get("fileName", "")).strip()
+    member_id     = str(payload.get("memberId", "")).strip()
+    highlight_key = str(payload.get("highlightKey", "")).strip()
+    file_name     = str(payload.get("fileName", "")).strip()
     total_bytes_decl: int | None = payload.get("totalBytes")
 
-    if not (member_id and job_id and file_name):
-        return JSONResponse(status_code=400, content={"status":"error","message":"memberId/jobId/fileName required"})
+    if not (member_id and highlight_key and file_name):
+        return JSONResponse(status_code=400, content={"status":"error","message":"memberId/highlightKey/fileName required"})
 
     # 1) 완료 서명 검증
     ok, reason = verify_complete_signature_b64url(
         expires_ms=x_expires,
         member_id=member_id,
-        job_id=job_id,
+        job_id=highlight_key,        # 내부 파라미터명은 job_id지만 값은 highlightKey
         upload_id=x_upload_id,
         signature_b64url=x_sig,
     )
@@ -358,46 +377,50 @@ async def post_complete(
 
     # 2) 병합
     try:
-        out_path, total_bytes_actual = _merge_parts(x_upload_id, member_id, job_id, file_name)
+        out_path, total_bytes_actual, ldt_path = _merge_parts(x_upload_id, member_id, highlight_key, file_name)
     except (FileNotFoundError, ValueError) as e:
         return JSONResponse(status_code=422, content={"status":"error","message":str(e)})
 
-    # 🧾 총 바이트 교차검증(선택적으로만)
+    # 🧾 총 바이트 교차검증(선택)
     if isinstance(total_bytes_decl, int) and total_bytes_decl > 0:
         if abs(total_bytes_decl - total_bytes_actual) > 0:
             logger.warning(f"[complete] total bytes mismatch: decl={total_bytes_decl} actual={total_bytes_actual}")
 
     # 3) 공개 URL + 길이
-    public_url = f"{settings.STATIC_BASE_URL.rstrip('/')}/{member_id}/{job_id}/{out_path.name}"
+    public_url = f"{settings.STATIC_BASE_URL.rstrip('/')}/{member_id}/{highlight_key}/{ldt_path}/{out_path.name}"
     try:
         duration = get_duration(out_path)
     except Exception as e:
         logger.debug(f"[complete] get_duration failed: {e}")
         duration = 0.0
 
-    # 완료 신호(PUB) — 필요 시 백엔드에서 수신
+    # 완료 신호(PUB) — key는 highlightKey 사용
     try:
         await ProgressBus.publish_kv(
-            job_id=job_id,
+            job_id=highlight_key,
             value={
                 "type": PROGRESS_TYPE.UPLOAD_COMPLETE,
                 "progress": 1.0,
-                "sizeBytes": total_bytes_actual,
+                "sizeBytes": int(total_bytes_actual),
                 "sourceUrl": public_url,
+                "folder": ldt_path,  # LocalDateTime 폴더명 (YYYY-MM-DDTHH-MM-SS)
                 "timestampMs": _now_ms(),
             },
         )
     except Exception as e:
         logger.debug(f"[complete] progress publish skip: {e}")
 
+    # 4) 응답
     return _ok({
         "type": "UPLOAD_COMPLETE",
         "memberId": member_id,
-        "jobId": job_id,
+        "highlightKey": highlight_key,
         "uploadId": x_upload_id,
         "sizeBytes": int(total_bytes_actual),
         "sourceUrl": public_url,
         "durationSec": round(float(duration), 3),
+        "folder": ldt_path,                      # ✅ 어디 폴더에 저장됐는지 바로 반환
+        "localDateTime": _now_local_str(),       # ✅ 사람이 읽는 LDT (로컬)
         "message": "original video received",
         "timestamp": _now_ms(),
     })

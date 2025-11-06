@@ -9,8 +9,9 @@ services:
     environment:
       # 기본값(필요시 .env에서 덮어씀)
       - SAVE_ROOT=/data/highlights
-      - STATIC_BASE_URL=http://tkv00.ddns.net:8000/static/highlights
+      - STATIC_BASE_URL=http://localhost:8000/static/highlights
       - REDIS_URL=redis://redis:6379/0
+      - MAX_UPLOAD_BYTES=838860800  
 
       - DRAW_FONTFILE=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
       - SHORTS_WIDTH=1080
