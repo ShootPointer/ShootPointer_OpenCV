@@ -22,6 +22,7 @@ from app.core.crypto import (
     hmac_sha256_hex,                          # (레거시 단일 업로드) HMAC-SHA256 HEX
     verify_chunk_signature_b64url,            # presigned 청크 PUT 검증(Base64URL)
     verify_complete_signature_b64url,         # presigned 완료 POST 검증(Base64URL)
+    verify_highlight_token,                   # highlightKey 토큰 복호화/검증
 )
 from app.services.ffmpeg import get_duration  # 병합 후 길이 메타 계산
 
@@ -209,18 +210,23 @@ async def put_chunk(
     expires: str,
     signature: str,
     x_member_id: str = Header(..., alias="x-member-id"),
-    x_highlight_key: str = Header(..., alias="x-highlight-key"),
+    x_highlight_token: str = Header(..., alias="x-highlight-key"),
     x_content_sha256: str | None = Header(None, alias="x-content-sha256"),
 ):
     # 🔒 partNumber 검증
     if not isinstance(partNumber, int) or partNumber < 1:
         return JSONResponse(status_code=422, content={"status": "error", "message": "invalid partNumber"})
 
-    # 1) 서명/만료 검증
+    # 1) highlightKey 토큰 복호화 → 실제 highlightKey 획득
+    tok_ok, highlight_key = verify_highlight_token(x_highlight_token)
+    if not tok_ok:
+        return JSONResponse(status_code=401, content={"status": "error", "message": highlight_key})
+
+    # 2) 서명/만료 검증
     ok, reason = verify_chunk_signature_b64url(
         expires_ms=expires,
         member_id=x_member_id,
-        job_id=x_highlight_key,   # 내부 검증 함수는 job_id 파라미터명을 쓰지만 값은 highlightKey
+        job_id=highlight_key,     # 내부 검증 함수는 job_id 파라미터명을 쓰지만 값은 highlightKey
         upload_id=uploadId,
         part_number=partNumber,
         signature_b64url=signature,
@@ -228,7 +234,7 @@ async def put_chunk(
     if not ok:
         return JSONResponse(status_code=401, content={"status": "error", "message": reason})
 
-    # 2) 청크 저장 (/tmp/uploads/<uploadId>/part-000001)
+    # 3) 청크 저장 (/tmp/uploads/<uploadId>/part-000001)
     base = UPLOAD_DIR / Path(uploadId).name   # 🔒 path traversal 방지
     _ensure_dir(base)
     dst = base / f"part-{int(partNumber):06d}"
@@ -270,7 +276,7 @@ async def put_chunk(
     # (옵션) 업로드 진행률 PUB — part 단위로 간단 표기
     try:
         await ProgressBus.publish_kv(
-            job_id=x_highlight_key,   # 진행률 키 = highlightKey
+            job_id=highlight_key,   # 진행률 키 = highlightKey
             value={
                 "type": PROGRESS_TYPE.UPLOAD_PROGRESS,
                 "progress": None,  # 총합을 모르면 None
@@ -285,7 +291,7 @@ async def put_chunk(
     return _ok({
         "type": "UPLOADING",
         "uploadId": uploadId,
-        "highlightKey": x_highlight_key,
+        "highlightKey": highlight_key,
         "partNumber": int(partNumber),
         "receivedBytes": size,
         "message": "chunk stored",
@@ -357,12 +363,16 @@ async def post_complete(
     payload: dict = Body(...),
 ):
     member_id     = str(payload.get("memberId", "")).strip()
-    highlight_key = str(payload.get("highlightKey", "")).strip()
+    highlight_token = str(payload.get("highlightKey", "")).strip()
     file_name     = str(payload.get("fileName", "")).strip()
     total_bytes_decl: int | None = payload.get("totalBytes")
 
-    if not (member_id and highlight_key and file_name):
+    if not (member_id and highlight_token and file_name):
         return JSONResponse(status_code=400, content={"status":"error","message":"memberId/highlightKey/fileName required"})
+
+    tok_ok, highlight_key = verify_highlight_token(highlight_token)
+    if not tok_ok:
+        return JSONResponse(status_code=401, content={"status":"error","message":highlight_key})
 
     # 1) 완료 서명 검증
     ok, reason = verify_complete_signature_b64url(
