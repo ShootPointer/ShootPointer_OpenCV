@@ -5,37 +5,57 @@ import json
 import time
 import uuid
 import tempfile
+import shutil
+import hashlib
 from pathlib import Path
 from typing import Optional
 
 import anyio
-from fastapi import APIRouter, Request, Query
+from fastapi import APIRouter, Request, Query, Header, Body
 from fastapi.responses import JSONResponse
 
 from app.core.config import settings
-from app.core.crypto import hmac_sha256_hex
-from app.core.progress import ProgressBus, PROGRESS_TYPE
 from app.core.logging import logging
+from app.core.progress import ProgressBus, PROGRESS_TYPE
+from app.core.crypto import (
+    hmac_sha256_hex,                          # 기존 단일 업로드 서명 검증용(HEX)
+    verify_chunk_signature_b64url,            # 청크 PUT 검증(B64URL)
+    verify_complete_signature_b64url,         # 완료 POST 검증(B64URL)
+)
+from app.services.ffmpeg import get_duration  # 병합 후 길이 메타 계산
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["upload"])
 
-# 업로드 바이트를 임시 파일로 받아둔 뒤, 처리가 끝나면 즉시 삭제한다.
-# 영구 저장/DB 업로드는 하지 않는다.
-
+# ─────────────────────────────────────────────────────────────
+# 공통 유틸
+# ─────────────────────────────────────────────────────────────
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
 def _ok(payload: dict) -> dict:
-    # 백엔드 요구 응답 포맷: {status:200, suceess:true, type:UPLOAD_SUCCESS}
-    # 오타("suceess")가 명시라면 그대로 맞춰줌. success도 같이 내려줌(하위 호환)
+    # 백엔드 요구 응답 포맷: {status:200, suceess:true, ...}
     return {
         "status": 200,
-        "suceess": True,   # <- 요청대로 철자 그대로
-        "success": True,   # <- 하위 호환
+        "suceess": True,  # 요청된 철자 유지
+        "success": True,  # 하위 호환
         **payload,
     }
 
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+def _ext_ok(name: str) -> bool:
+    # 🔒 허용 확장자만 통과 (필요하면 .env로 빼도 됨)
+    allowed = {".mp4", ".mov", ".mkv", ".m4v"}
+    return Path(name).suffix.lower() in allowed
+
+# 업로드 청크 최대 바이트 (없으면 무제한)
+_CHUNK_MAX_BYTES = int(getattr(settings, "UPLOAD_CHUNK_MAX_MB", 0) or 0) * 1024 * 1024
+
+# ─────────────────────────────────────────────────────────────
+# (A) 단일 업로드: PUT /api/upload  (네가 만든 기존 엔드포인트)
+# ─────────────────────────────────────────────────────────────
 @router.put("/upload", summary="Pre-signed 업로드 수신 (서명 검증 + 진행률 PUB)")
 async def upload_video(
     request: Request,
@@ -52,8 +72,11 @@ async def upload_video(
     total_bytes = int(request.headers.get("content-length") or 0)
 
     try:
+        # 🔒 파일명 확장자 체크
+        if not _ext_ok(fileName):
+            return JSONResponse(status_code=415, content={"status": "error", "message": "unsupported media type"})
+
         # 1) 형식/만료/서명 검증
-        # message = f"{expiresMs}:{memberId}:{jobId}:{fileName}"
         step = "verify_signature"
         if expires <= 0:
             return JSONResponse(status_code=422, content={"status": "error", "step": step, "message": "expires(ms) required"})
@@ -69,30 +92,34 @@ async def upload_video(
 
         # 2) UPLOAD_START publish
         step = "publish_start"
-        await ProgressBus.publish_kv(
-            job_id=jobId,
-            value={
-                "type": PROGRESS_TYPE.UPLOAD_START,
-                "progress": 0.0,
-                "totalBytes": total_bytes or None,
-                "receivedBytes": 0,
-                "timestampMs": _now_ms(),
-            },
-        )
+        try:
+            await ProgressBus.publish_kv(
+                job_id=jobId,
+                value={
+                    "type": PROGRESS_TYPE.UPLOAD_START,
+                    "progress": 0.0,
+                    "totalBytes": total_bytes or None,
+                    "receivedBytes": 0,
+                    "timestampMs": _now_ms(),
+                },
+            )
+        except Exception as e:
+            logger.warning(f"[upload] progress publish failed: {e}")
 
         # 3) 스트리밍 수신(임시 파일). 5초 단위 진행률 PUB
         step = "stream_and_save"
-        # 임시 파일 생성 (자동 삭제 위해 나중에 unlink)
         fd, path_str = tempfile.mkstemp(prefix="upload_", suffix=Path(fileName).suffix or ".mp4")
         tmp_path = Path(path_str)
 
         last_pub = time.perf_counter()
-        interval = float(settings.PROGRESS_INTERVAL_SEC or 5.0)
+        interval = float(getattr(settings, "PROGRESS_INTERVAL_SEC", 5.0) or 5.0)
 
         async with await anyio.open_file(tmp_path, "wb") as f:
             async for chunk in request.stream():
                 if not chunk:
                     continue
+
+                # 📏 per-request 크기 한도(단일 업로드에선 전체가 한 요청이므로 content-length로도 걸림)
                 recv_bytes += len(chunk)
                 await f.write(chunk)
 
@@ -100,42 +127,38 @@ async def upload_video(
                 if now_t - last_pub >= interval:
                     last_pub = now_t
                     prog = (recv_bytes / total_bytes) if total_bytes > 0 else None
-                    await ProgressBus.publish_kv(
-                        job_id=jobId,
-                        value={
-                            "type": PROGRESS_TYPE.UPLOAD_PROGRESS,
-                            "progress": prog,
-                            "totalBytes": total_bytes or None,
-                            "receivedBytes": recv_bytes,
-                            "timestampMs": _now_ms(),
-                        },
-                    )
+                    try:
+                        await ProgressBus.publish_kv(
+                            job_id=jobId,
+                            value={
+                                "type": PROGRESS_TYPE.UPLOAD_PROGRESS,
+                                "progress": prog,
+                                "totalBytes": total_bytes or None,
+                                "receivedBytes": recv_bytes,
+                                "timestampMs": _now_ms(),
+                            },
+                        )
+                    except Exception as e:
+                        logger.debug(f"[upload] progress publish skip: {e}")
 
         # 끝난 직후 한 번 더 진행률 PUB(100% 보정)
-        await ProgressBus.publish_kv(
-            job_id=jobId,
-            value={
-                "type": PROGRESS_TYPE.UPLOAD_PROGRESS,
-                "progress": 1.0 if total_bytes > 0 else None,
-                "totalBytes": total_bytes or None,
-                "receivedBytes": recv_bytes,
-                "timestampMs": _now_ms(),
-            },
-        )
-
-        # 4) 업로드 성공 PUB(스펙엔 COMPLETE만 있지만, 업로드 쪽 완료 알림도 필요하면 여기서 한 번 더)
-        step = "publish_completed"
-        # 필요 시 Spring에서 업로드 완료를 감지 후 PROCESSING_START를 트리거
-        # 여기서는 업로드 완료를 알리진 않고, HTTP 응답에서 성공만 돌려줌.
+        try:
+            await ProgressBus.publish_kv(
+                job_id=jobId,
+                value={
+                    "type": PROGRESS_TYPE.UPLOAD_PROGRESS,
+                    "progress": 1.0 if total_bytes > 0 else None,
+                    "totalBytes": total_bytes or None,
+                    "receivedBytes": recv_bytes,
+                    "timestampMs": _now_ms(),
+                },
+            )
+        except Exception as e:
+            logger.debug(f"[upload] final progress publish skip: {e}")
 
         took_ms = round((time.perf_counter() - t0) * 1000.0, 1)
 
-        # 5) HTTP 응답(백엔드 요구 포맷)
-        #   {
-        #     "status":200,
-        #     "suceess":true,
-        #     "type": "UPLOAD_SUCCESS"
-        #   }
+        # 4) HTTP 응답
         return _ok({
             "type": "UPLOAD_SUCCESS",
             "jobId": jobId,
@@ -151,9 +174,230 @@ async def upload_video(
             content={"status": "error", "step": step, "message": str(e)},
         )
     finally:
-        # 원본은 저장하지 않으므로 즉시 삭제
+        # 원본은 저장하지 않으므로 즉시 삭제 (단일 업로드 엔드포인트의 정책)
         if tmp_path and tmp_path.exists():
             try:
                 tmp_path.unlink(missing_ok=True)
             except Exception:
                 pass
+
+
+# ─────────────────────────────────────────────────────────────
+# (B) 청크 업로드: PUT /api/presigned/chunk
+#     쿼리: uploadId, partNumber, expires, signature(base64url)
+#     헤더: x-member-id, x-job-id, (옵션) x-content-sha256
+#     본문: 바이너리(이 파트 내용)
+# ─────────────────────────────────────────────────────────────
+UPLOAD_DIR = Path(getattr(settings, "UPLOAD_DIR", "/tmp/uploads"))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+@router.put("/presigned/chunk", summary="Presigned 청크 업로드 (Base64URL 서명)")
+async def put_chunk(
+    request: Request,
+    uploadId: str,
+    partNumber: int,
+    expires: str,
+    signature: str,
+    x_member_id: str = Header(..., alias="x-member-id"),
+    x_job_id: str = Header(..., alias="x-job-id"),
+    x_content_sha256: str | None = Header(None, alias="x-content-sha256"),
+):
+    # 🔒 partNumber 검증
+    if not isinstance(partNumber, int) or partNumber < 1:
+        return JSONResponse(status_code=422, content={"status": "error", "message": "invalid partNumber"})
+
+    # 1) 서명/만료 검증
+    ok, reason = verify_chunk_signature_b64url(
+        expires_ms=expires,
+        member_id=x_member_id,
+        job_id=x_job_id,
+        upload_id=uploadId,
+        part_number=partNumber,
+        signature_b64url=signature,
+    )
+    if not ok:
+        return JSONResponse(status_code=401, content={"status": "error", "message": reason})
+
+    # 2) 청크 저장 (/tmp/uploads/<uploadId>/part-000001)
+    base = UPLOAD_DIR / Path(uploadId).name   # 🔒 path traversal 방지
+    _ensure_dir(base)
+    dst = base / f"part-{int(partNumber):06d}"
+
+    # 📏 content-length가 있다면 선제 한도 체크
+    cl = request.headers.get("content-length")
+    if _CHUNK_MAX_BYTES and cl and cl.isdigit():
+        if int(cl) > _CHUNK_MAX_BYTES:
+            return JSONResponse(status_code=413, content={"status":"error","message":"chunk too large"})
+
+    size = 0
+    sha256 = hashlib.sha256()
+    async with await anyio.open_file(dst, "wb") as f:
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            size += len(chunk)
+            # 📏 스트리밍 중 한도 초과 시 즉시 중단
+            if _CHUNK_MAX_BYTES and size > _CHUNK_MAX_BYTES:
+                try: dst.unlink(missing_ok=True)
+                except: pass
+                return JSONResponse(status_code=413, content={"status":"error","message":"chunk too large"})
+            sha256.update(chunk)
+            await f.write(chunk)
+
+    # 🔒 (선택) 청크 무결성: 헤더 제공 시 비교
+    if x_content_sha256:
+        got = sha256.hexdigest()
+        if x_content_sha256.lower().startswith("sha256:"):
+            xh = x_content_sha256.split(":", 1)[1].lower()
+        else:
+            xh = x_content_sha256.lower()
+        if xh != got:
+            try: dst.unlink(missing_ok=True)
+            except: pass
+            return JSONResponse(status_code=422, content={"status":"error","message":"chunk checksum mismatch"})
+
+    logger.info(f"[chunk] {uploadId} part={partNumber} bytes={size}")
+
+    # (옵션) 업로드 진행률 PUB — part 단위로 간단 표기
+    try:
+        await ProgressBus.publish_kv(
+            job_id=x_job_id,
+            value={
+                "type": PROGRESS_TYPE.UPLOAD_PROGRESS,
+                "progress": None,  # 총합을 모르면 None
+                "receivedBytes": size,
+                "partNumber": int(partNumber),
+                "timestampMs": _now_ms(),
+            },
+        )
+    except Exception as e:
+        logger.debug(f"[chunk] progress publish skip: {e}")
+
+    return _ok({
+        "type": "UPLOADING",
+        "uploadId": uploadId,
+        "partNumber": int(partNumber),
+        "receivedBytes": size,
+        "message": "chunk stored",
+        "timestamp": _now_ms(),
+    })
+
+
+# ─────────────────────────────────────────────────────────────
+# (C) 병합 완료: POST /api/presigned/complete
+#     헤더: x-upload-id, x-sig(Base64URL), x-expires(ms)
+#     바디: { memberId, jobId, fileName, totalBytes, parts:[...] }
+#     처리: /tmp/uploads/<uploadId>/part-*  →  /data/highlights/<member>/<job>/original_*.mp4
+#           + STATIC_BASE_URL 로 sourceUrl 구성, durationSec 포함
+# ─────────────────────────────────────────────────────────────
+def _merge_parts(upload_id: str, member_id: str, job_id: str, file_name: str) -> tuple[Path, int]:
+    base = UPLOAD_DIR / Path(upload_id).name    # 🔒 path traversal 방지
+    if not base.exists():
+        raise FileNotFoundError("no parts for uploadId")
+
+    parts = sorted(base.glob("part-*"))
+    if not parts:
+        raise FileNotFoundError("no parts found")
+
+    # 🧾 연속성 체크: part-000001부터 차례대로 있는지(누락 감지)
+    for i, p in enumerate(parts, start=1):
+        expect = f"part-{i:06d}"
+        if p.name != expect:
+            raise FileNotFoundError(f"missing part {expect}")
+
+    # 🔒 파일명 확장자 체크
+    if not _ext_ok(file_name):
+        raise ValueError("unsupported media type")
+
+    ext = Path(file_name).suffix or ".mp4"
+    out_dir = Path(settings.SAVE_ROOT) / member_id / job_id
+    _ensure_dir(out_dir)
+    out_path = out_dir / f"original_{uuid.uuid4().hex[:8]}{ext}"
+
+    total = 0
+    with out_path.open("wb") as w:
+        for p in parts:
+            s = p.stat().st_size
+            with p.open("rb") as r:
+                shutil.copyfileobj(r, w)
+            total += s
+
+    # 파트 정리
+    try:
+        shutil.rmtree(base, ignore_errors=True)
+    except Exception:
+        pass
+
+    return out_path, total
+
+@router.post("/presigned/complete", summary="Presigned 업로드 병합 완료 → sourceUrl 반환")
+async def post_complete(
+    x_upload_id: str = Header(..., alias="x-upload-id"),
+    x_sig: str = Header(..., alias="x-sig"),
+    x_expires: str = Header(..., alias="x-expires"),
+    payload: dict = Body(...),
+):
+    member_id = str(payload.get("memberId", "")).strip()
+    job_id    = str(payload.get("jobId", "")).strip()
+    file_name = str(payload.get("fileName", "")).strip()
+    total_bytes_decl: int | None = payload.get("totalBytes")
+
+    if not (member_id and job_id and file_name):
+        return JSONResponse(status_code=400, content={"status":"error","message":"memberId/jobId/fileName required"})
+
+    # 1) 완료 서명 검증
+    ok, reason = verify_complete_signature_b64url(
+        expires_ms=x_expires,
+        member_id=member_id,
+        job_id=job_id,
+        upload_id=x_upload_id,
+        signature_b64url=x_sig,
+    )
+    if not ok:
+        return JSONResponse(status_code=401, content={"status":"error","message":reason})
+
+    # 2) 병합
+    try:
+        out_path, total_bytes_actual = _merge_parts(x_upload_id, member_id, job_id, file_name)
+    except (FileNotFoundError, ValueError) as e:
+        return JSONResponse(status_code=422, content={"status":"error","message":str(e)})
+
+    # 🧾 총 바이트 교차검증(선택적으로만)
+    if isinstance(total_bytes_decl, int) and total_bytes_decl > 0:
+        if abs(total_bytes_decl - total_bytes_actual) > 0:
+            logger.warning(f"[complete] total bytes mismatch: decl={total_bytes_decl} actual={total_bytes_actual}")
+
+    # 3) 공개 URL + 길이
+    public_url = f"{settings.STATIC_BASE_URL.rstrip('/')}/{member_id}/{job_id}/{out_path.name}"
+    try:
+        duration = get_duration(out_path)
+    except Exception as e:
+        logger.debug(f"[complete] get_duration failed: {e}")
+        duration = 0.0
+
+    # 완료 신호(PUB) — 필요 시 백엔드에서 수신
+    try:
+        await ProgressBus.publish_kv(
+            job_id=job_id,
+            value={
+                "type": PROGRESS_TYPE.UPLOAD_COMPLETE,
+                "progress": 1.0,
+                "sizeBytes": total_bytes_actual,
+                "sourceUrl": public_url,
+                "timestampMs": _now_ms(),
+            },
+        )
+    except Exception as e:
+        logger.debug(f"[complete] progress publish skip: {e}")
+
+    return _ok({
+        "type": "UPLOAD_COMPLETE",
+        "memberId": member_id,
+        "jobId": job_id,
+        "uploadId": x_upload_id,
+        "sizeBytes": int(total_bytes_actual),
+        "sourceUrl": public_url,
+        "durationSec": round(float(duration), 3),
+        "message": "original video received",
+        "timestamp": _now_ms(),
+    })

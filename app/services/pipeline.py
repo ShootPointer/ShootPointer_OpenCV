@@ -138,22 +138,13 @@ def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
-def save_clip_to_repo(src_path: Path, member_id: str, job_id: str, index: int) -> tuple[Path, str]:
+# ─────────────────────────────────────────────────────────────
+# 공통 이동/복사 유틸 (rename 우선, 실패 시 copy)
+# ─────────────────────────────────────────────────────────────
+def _move_or_copy(src_path: Path, dst_path: Path) -> None:
     """
-    src_path(임시 클립)를 서비스 저장소(SAVE_ROOT)로 이동/복사하고, 공개 URL을 만들어 반환.
-    - 최종 파일명은 index 대신 UUID로 부여(요구사항 반영).
-    return: (dst_path, public_url)
+    동일 볼륨이면 rename이 가장 빠름. 실패(크로스 디바이스 등) 시 copy 후 원본 삭제.
     """
-    root = Path(settings.SAVE_ROOT)
-    dst_dir = root / member_id / job_id
-    ensure_dir(dst_dir)
-
-    # 🔁 변경 포인트: 최종 파일명은 uuid 기반으로 생성
-    #   - 하이픈 없는 32자 hex 사용 (경로/호환성 안전)
-    uuid_name = f"{uuid.uuid4().hex}{src_path.suffix}"
-    dst_path = dst_dir / uuid_name
-
-    # 이동(같은 볼륨이면 rename으로 빠르게), 다르면 copy 후 원본 삭제
     try:
         src_path.rename(dst_path)
     except Exception:
@@ -163,5 +154,69 @@ def save_clip_to_repo(src_path: Path, member_id: str, job_id: str, index: int) -
         except Exception:
             pass
 
-    public_url = f"{settings.STATIC_BASE_URL.rstrip('/')}/{member_id}/{job_id}/{dst_path.name}"
+
+def _build_public_url(member_id: str, job_id: str, *subparts: str) -> str:
+    base = f"{settings.STATIC_BASE_URL.rstrip('/')}/{member_id}/{job_id}"
+    for sp in subparts:
+        if sp:
+            base += f"/{sp}"
+    return base
+
+
+# ─────────────────────────────────────────────────────────────
+# 기존 표준 저장: index 인자는 받지만, 파일명은 UUID로 생성(요구사항 반영)
+# 저장 경로: SAVE_ROOT/<member>/<job>/
+# URL: STATIC_BASE_URL/<member>/<job>/<uuid>.mp4
+# ─────────────────────────────────────────────────────────────
+def save_clip_to_repo(src_path: Path, member_id: str, job_id: str, index: int) -> tuple[Path, str]:
+    """
+    src_path(임시 클립)를 서비스 저장소(SAVE_ROOT)로 이동/복사하고, 공개 URL을 만들어 반환.
+    - 최종 파일명은 UUID 기반으로 생성(하이픈 없는 32자 hex)
+    return: (dst_path, public_url)
+    """
+    root = Path(settings.SAVE_ROOT)
+    dst_dir = root / member_id / job_id
+    ensure_dir(dst_dir)
+
+    uuid_name = f"{uuid.uuid4().hex}{src_path.suffix}"
+    dst_path = dst_dir / uuid_name
+
+    _move_or_copy(src_path, dst_path)
+    public_url = _build_public_url(member_id, job_id, dst_path.name)
+    return dst_path, public_url
+
+
+# ─────────────────────────────────────────────────────────────
+# 신규 유틸: 하위 폴더(subdir) + prefix + UUID 저장
+# 저장 경로: SAVE_ROOT/<member>/<job>[/subdir]/<prefix><uuid8>.mp4
+# URL:       STATIC_BASE_URL/<member>/<job>[/subdir]/<prefix><uuid8>.mp4
+# ─────────────────────────────────────────────────────────────
+def save_clip_as_uuid(
+    src_path: Path,
+    member_id: str,
+    job_id: str,
+    subdir: str | None = None,
+    prefix: str = "",
+) -> tuple[Path, str]:
+    """
+    src_path(임시) -> SAVE_ROOT/<member>/<job>[/subdir]/<prefix><uuid8>.mp4 로 이동 or 복사
+    반환: (dst_path, public_url)
+    """
+    root = Path(settings.SAVE_ROOT)
+    dst_dir = root / member_id / job_id
+    if subdir:
+        dst_dir = dst_dir / subdir
+    ensure_dir(dst_dir)
+
+    name = f"{prefix}{uuid.uuid4().hex[:8]}{src_path.suffix}"
+    dst_path = dst_dir / name
+
+    _move_or_copy(src_path, dst_path)
+
+    if subdir:
+        public_url = _build_public_url(member_id, job_id, subdir, name)
+    else:
+        public_url = _build_public_url(member_id, job_id, name)
+
+    logger.info(f"[pipeline] saved -> {dst_path} (url={public_url})")
     return dst_path, public_url

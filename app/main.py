@@ -17,6 +17,7 @@ from app.core.config import settings
 from app.core.logging import setup_logging
 from app.routers import upload, highlight, player, frames
 from app.routers import presigned_upload, process
+from app.routers import ai_demo  # ✅ 추가: 데모 하이라이트 라우터
 
 # ─────────────────────────────────────────────────────────────
 # 로깅 초기화
@@ -87,7 +88,7 @@ class UploadLimitMiddleware(BaseHTTPMiddleware):
                             content={"error": "payload_too_large", "detail": "upload exceeds MAX_UPLOAD_BYTES"},
                         )
         except Exception as e:
-            # 제한 체크 자체 실패 시엔 그냥 통과(로그만 남김)
+            # 제한 체크 실패 시 통과(로그만)
             logger.warning(f"Upload limit check failed: {e}")
 
         return await call_next(request)
@@ -97,13 +98,13 @@ app.add_middleware(UploadLimitMiddleware)
 
 # ─────────────────────────────────────────────────────────────
 # 정적 파일 서빙 마운트
-#   - STATIC_BASE_URL의 path 부분을 FastAPI에 마운트
-#   - 예: STATIC_BASE_URL = http://localhost:8000/static/highlights
-#         → path = "/static/highlights" 를 SAVE_ROOT에 매핑
-#   - 운영에서 Nginx로 서빙할 때도 개발 편의를 위해 두어도 무방
+#   - STATIC_BASE_URL의 path를 FastAPI에 매핑
+#   - 예: STATIC_BASE_URL = "http://tkv0011.ddns.net:8000/static/highlights"
+#       -> path "/static/highlights" 를 SAVE_ROOT에 연결
 # ─────────────────────────────────────────────────────────────
 parsed = urlparse(settings.STATIC_BASE_URL)
 static_path = parsed.path or "/static/highlights"
+
 app.mount(
     static_path,
     StaticFiles(directory=settings.SAVE_ROOT, html=False),
@@ -139,3 +140,6 @@ app.include_router(player.router)
 app.include_router(frames.router)
 app.include_router(presigned_upload.router)
 app.include_router(process.router)
+
+# ✅ 데모 하이라이트(자동식별 → 지정 구간 컷 → 메타데이터/집계) 라우터 등록
+app.include_router(ai_demo.router, prefix="")
