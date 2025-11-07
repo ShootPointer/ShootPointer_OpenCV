@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import List, Optional, Union
 from pathlib import Path
 
@@ -19,7 +19,11 @@ class Segment(BaseModel):
 
 class HighlightUrlReq(BaseModel):
     memberId: str
-    jobId: str
+    highlightKey: Optional[str] = Field(default=None, description="신규 하이라이트 키")
+    jobId: Optional[str] = Field(
+        default=None,
+        description="레거시 호환용. highlightKey와 동일해야 함",
+    )
     sourceUrl: str
     # timestamps는 둘 중 하나:
     # 1) 중심 시점 배열 -> [1.0, 5.2, 12.0]
@@ -29,6 +33,19 @@ class HighlightUrlReq(BaseModel):
     post: Optional[float] = None
     maxClips: Optional[int] = None
     jerseyNumber: Optional[int] = None  # 옵션(파일명 접두사에만 사용 가능)
+
+    @model_validator(mode="after")
+    def _ensure_highlight_key(self) -> "HighlightUrlReq":
+        highlight_key = self.highlightKey or self.jobId
+        if not highlight_key:
+            raise ValueError("highlightKey or jobId required")
+        if self.highlightKey and self.jobId and self.highlightKey != self.jobId:
+            raise ValueError("highlightKey and jobId must match")
+        if not self.highlightKey:
+            object.__setattr__(self, "highlightKey", self.jobId)
+        elif not self.jobId:
+            object.__setattr__(self, "jobId", self.highlightKey)
+        return self
 
 def _normalize_centers(ts: Union[List[float], List[Segment]]) -> List[float]:
     centers: List[float] = []
@@ -47,19 +64,26 @@ async def highlight_by_url(req: HighlightUrlReq):
     """
     외부/Presigned URL을 받아 임시 저장 → 하이라이트 생성 → SAVE_ROOT에 UUID 파일명으로 저장 →
     Redis 진행률(PROCESSING)과 최종 결과(COMPLETE)을 발행(PUB/SUB + KV 저장).
-    상세 결과 JSON은 Redis KV key: `highlight-{jobId}` 로 확인 가능.
+    상세 결과 JSON은 Redis KV key: `{settings.RESULT_KEY_PREFIX}` + highlightKey 로 확인 가능.
     """
     member_id = req.memberId
-    job_id = req.jobId
+    highlight_key = req.highlightKey
 
     # 1) 시작 진행률
-    await publish_progress(member_id, job_id, 0.01, "downloading source")
+    await publish_progress(
+        member_id,
+        highlight_key,
+        0.01,
+        "downloading source",
+        type_="PROCESSING",
+        stage="downloading",
+    )    
 
     # 2) 다운로드
     try:
         src_path = await download_to_temp(req.sourceUrl, suffix=".mp4")
     except Exception as e:
-        await publish_error(member_id, job_id, f"download failed: {e}")
+        await publish_error(member_id, highlight_key, f"download failed: {e}")
         raise HTTPException(status_code=400, detail=f"download failed: {e}")
 
     try:
@@ -83,18 +107,27 @@ async def highlight_by_url(req: HighlightUrlReq):
 
         total = len(tmp_clips)
 
-        # 5) SAVE_ROOT/{memberId}/{jobId}/{uuid}.mp4 로 이동 + 공개 URL 생성
+        # 5) SAVE_ROOT/{memberId}/{highlight_key}/{uuid}.mp4 로 이동 + 공개 URL 생성
         urls: List[str] = []
         for i, tmp in enumerate(tmp_clips):
-            _, url = save_clip_to_repo(tmp, member_id, job_id, index=i)
+            _, url = save_clip_to_repo(tmp, member_id, highlight_key, index=i)
             urls.append(url)
-            await publish_progress(member_id, job_id, (i + 1) / total, f"saved {i+1}/{total}")
+            await publish_progress(
+                member_id,
+                highlight_key,
+                (i + 1) / total,
+                f"saved {i+1}/{total}",
+                type_="PROCESSING",
+                stage="cutting",
+                current_clip=i + 1,
+                total_clips=total,
+            )            
 
         # 6) 최종 COMPLETE 발행 (+KV 저장)
-        await publish_result(member_id, job_id, urls, final=True)
+        await publish_result(member_id, highlight_key, urls, final=True)
 
     except Exception as e:
-        await publish_error(member_id, job_id, str(e))
+        await publish_error(member_id, highlight_key, str(e))
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         # 임시 소스 정리
@@ -103,13 +136,13 @@ async def highlight_by_url(req: HighlightUrlReq):
         except Exception:
             pass
 
-    # 간단 응답 — 상세 결과는 Redis KV highlight-{jobId}에 저장됨
+    # 간단 응답 — 상세 결과는 Redis KV highlight-{highlight_key}에 저장됨
     return {
         "status": 200,
         "success": True,
         "message": f"{len(urls)} clips created",
         "memberId": member_id,
-        "jobId": job_id,
+        "jobId": highlight_key,
         "count": len(urls),
         "urls": urls,  # 디버그/개발 편의상 포함(운영에서 빼도 됨)
     }

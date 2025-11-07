@@ -213,6 +213,19 @@ async def _store_chunk(
     except Exception as e:
         logger.debug(f"[chunk] progress publish skip: {e}")
 
+    try:
+        await publish_progress(
+            member_id,
+            highlight_key,
+            None,
+            "chunk stored",
+            type_="UPLOADING",
+            stage="uploading",
+            received_bytes=size,
+        )
+    except Exception as e:
+        logger.debug(f"[chunk] progress publish skip(pubsub): {e}")
+
     return highlight_key, size
 
 
@@ -326,7 +339,14 @@ async def _auto_ai_demo_after_complete(member_id: str, highlight_key: str, sourc
     )
 
     try:
-        await publish_progress(member_id, highlight_key, 0.05, "ai-demo queued")
+        await publish_progress(
+            member_id,
+            highlight_key,
+            0.05,
+            "ai-demo queued",
+            type_="PROCESSING",
+            stage="ai-demo",
+        )    
     except Exception:
         pass
 
@@ -355,7 +375,16 @@ async def _auto_ai_demo_after_complete(member_id: str, highlight_key: str, sourc
         )
 
         try:
-            await publish_progress(member_id, highlight_key, 0.6, "ai-demo clips saved")
+            await publish_progress(
+                member_id,
+                highlight_key,
+                0.6,
+                "ai-demo clips saved",
+                type_="PROCESSING",
+                stage="ai-demo",
+                total_clips=clip_count,
+                current_clip=clip_count,
+            )        
         except Exception:
             pass
 
@@ -469,6 +498,20 @@ async def upload_video(
         except Exception as e:
             logger.warning(f"[upload] progress publish failed: {e}")
 
+        try:
+            await publish_progress(
+                memberId,
+                jobId,
+                0.0,
+                "original video uploading",
+                type_="UPLOADING",
+                total_bytes=total_bytes or None,
+                received_bytes=0,
+                stage="uploading",
+            )
+        except Exception as e:
+            logger.debug(f"[upload] progress publish skip(pubsub): {e}")
+        
         # 3) 스트리밍 수신(임시 파일). 5초 단위 진행률 PUB
         step = "stream_and_save"
         fd, path_str = tempfile.mkstemp(
@@ -503,6 +546,20 @@ async def upload_video(
                     except Exception as e:
                         logger.debug(f"[upload] progress publish skip: {e}")
 
+                    try:
+                        await publish_progress(
+                            memberId,
+                            jobId,
+                            prog,
+                            "original video uploading",
+                            type_="UPLOADING",
+                            total_bytes=total_bytes or None,
+                            received_bytes=recv_bytes,
+                            stage="uploading",
+                        )
+                    except Exception as e:
+                        logger.debug(f"[upload] progress publish skip(pubsub): {e}")
+
         # 종료 시 100% 보정
         try:
             await ProgressBus.publish_kv(
@@ -517,6 +574,20 @@ async def upload_video(
             )
         except Exception as e:
             logger.debug(f"[upload] final progress publish skip: {e}")
+
+        try:
+            await publish_progress(
+                memberId,
+                jobId,
+                1.0 if total_bytes > 0 else None,
+                "original video uploading",
+                type_="UPLOADING",
+                total_bytes=total_bytes or None,
+                received_bytes=recv_bytes,
+                stage="uploading",
+            )
+        except Exception as e:
+            logger.debug(f"[upload] final progress publish skip(pubsub): {e}")
 
         took_ms = round((time.perf_counter() - t0) * 1000.0, 1)
 
@@ -830,6 +901,19 @@ async def post_complete(
         )
     except Exception as e:
         logger.debug(f"[complete] progress publish skip: {e}")
+
+    try:
+        await publish_progress(
+            member_id,
+            highlight_key,
+            None,
+            "original video received",
+            type_="UPLOAD_COMPLETE",
+            total_bytes=int(total_bytes_actual),
+            stage="uploading",
+        )
+    except Exception as e:
+        logger.debug(f"[complete] progress publish skip(pubsub): {e}")
 
     # 5) (옵션) Presigned 업로드 완료 후 AI-DEMO 자동 실행
     if getattr(settings, "AUTO_RUN_AI_DEMO", False):

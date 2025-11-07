@@ -133,7 +133,14 @@ async def highlight_zip(
         # 진행률 시작(옵션)
         do_publish = bool(memberId and jobId)
         if do_publish:
-            await publish_progress(memberId, jobId, 0.01, "downloading/upload saved")
+                await publish_progress(
+                memberId,
+                jobId,
+                0.01,
+                "downloading/upload saved",
+                type_="PROCESSING",
+                stage="preparing",
+            )    
 
         # 클립 생성 (임시 디렉터리에 생성)
         results = generate_highlight_clips(
@@ -155,7 +162,16 @@ async def highlight_zip(
 
                 # 대략적 진행률 (생성/저장 기준)
                 progress = (i + 1) / total
-                await publish_progress(memberId, jobId, progress, f"saved {i+1}/{total}")
+                await publish_progress(
+                    memberId,
+                    jobId,
+                    progress,
+                    f"saved {i+1}/{total}",
+                    type_="PROCESSING",
+                    stage="cutting",
+                    current_clip=i + 1,
+                    total_clips=total,
+                )                
 
             # 최종 COMPLETE (KV + PUB/SUB)
             await publish_result(memberId, jobId, public_urls, final=True)
@@ -222,7 +238,14 @@ async def highlight_auto_zip(
 
         do_publish = bool(memberId and jobId)
         if do_publish:
-            await publish_progress(memberId, jobId, 0.01, "downloading/upload saved")
+            await publish_progress(
+                memberId,
+                jobId,
+                0.01,
+                "downloading/upload saved",
+                type_="PROCESSING",
+                stage="preparing",
+            )        
 
         # 클립 생성
         results = generate_highlight_clips(
@@ -237,7 +260,16 @@ async def highlight_auto_zip(
             for i, tmp_clip in enumerate(clip_paths):
                 _, url = save_clip_to_repo(tmp_clip, memberId, jobId, index=i)
                 public_urls.append(url)
-                await publish_progress(memberId, jobId, (i + 1) / total, f"saved {i+1}/{total}")
+                await publish_progress(
+                    memberId,
+                    jobId,
+                    (i + 1) / total,
+                    f"saved {i+1}/{total}",
+                    type_="PROCESSING",
+                    stage="cutting",
+                    current_clip=i + 1,
+                    total_clips=total,
+                )            
             await publish_result(memberId, jobId, public_urls, final=True)
 
         # ZIP 빌드
@@ -303,7 +335,14 @@ async def highlight_batch(
     # (옵션) 진행률 시작
     do_publish = bool(memberId and jobId)
     if do_publish:
-        await publish_progress(memberId, jobId, 0.01, "batch: upload saved")
+        await publish_progress(
+            memberId,
+            jobId,
+            0.01,
+            "batch: upload saved",
+            type_="PROCESSING",
+            stage="preparing",
+        )        
 
     try:
         # 영상별 처리
@@ -314,9 +353,14 @@ async def highlight_batch(
             all_clips.extend(clips)
             if do_publish:
                 await publish_progress(
-                    memberId, jobId,
+                    memberId,
+                    jobId,
                     (idx + 1) / max(1, len(local_paths)),
-                    f"processed {idx+1}/{len(local_paths)}"
+                    f"processed {idx+1}/{len(local_paths)}",
+                    type_="PROCESSING",
+                    stage="processing",
+                    current_clip=idx + 1,
+                    total_clips=len(local_paths),
                 )
 
         # 합본
@@ -332,9 +376,14 @@ async def highlight_batch(
                 _, url = save_clip_to_repo(tmp_clip, memberId, jobId, index=i)
                 public_urls.append(url)
                 await publish_progress(
-                    memberId, jobId,
+                    memberId,
+                    jobId,
                     0.8 + 0.2 * (i + 1) / len(all_clips),
-                    f"saved {i+1}/{len(all_clips)}"
+                    f"saved {i+1}/{len(all_clips)}",
+                    type_="PROCESSING",
+                    stage="cutting",
+                    current_clip=i + 1,
+                    total_clips=len(all_clips),    
                 )
             await publish_result(memberId, jobId, public_urls, final=True)
 

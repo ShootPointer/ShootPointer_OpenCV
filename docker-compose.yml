@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   fast-api:
     build: .
@@ -13,7 +11,7 @@ services:
       - STATIC_BASE_URL=http://localhost:8000/static/highlights
       - REDIS_URL=redis://redis:6379/0
       - MAX_UPLOAD_BYTES=838860800            # 800MB
-      - PLAN_REGISTRY_PY=app/services/registry.py
+      - PLAN_REGISTRY_PY=app/data/registry.py
       - ALLOW_ORIGINS=http://localhost:3000
 
       # ffmpeg/오버레이 파라미터(이미지 안 폰트 경로 사용)

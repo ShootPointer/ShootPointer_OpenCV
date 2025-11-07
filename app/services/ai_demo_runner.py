@@ -68,6 +68,26 @@ class AISelector:
         return [(float(a), float(b), str(lbl)) for (a, b, lbl) in segments]
 
 
+def _ensure_save_root(member_id: str, highlight_key: str) -> Path:
+    base = Path(settings.SAVE_ROOT)
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        target = base / member_id / highlight_key
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+    except PermissionError as e:
+        raise AIHighlightError(
+            f"SAVE_ROOT '{settings.SAVE_ROOT}' is not writable (permission denied)",
+            status_code=500,
+        ) from e
+    except OSError as e:
+        raise AIHighlightError(
+            f"failed to prepare SAVE_ROOT '{settings.SAVE_ROOT}': {e}",
+            status_code=500,
+        ) from e
+
+
+
 def _prepare_segments(
     src_path: Path,
     base_name: str,
@@ -91,6 +111,7 @@ def _prepare_segments(
     duration = ffprobe_duration(str(src_path))
     work_dir = Path("/tmp/uploads")
     work_dir.mkdir(parents=True, exist_ok=True)
+    dst_dir = _ensure_save_root(member_id, highlight_key)
 
     counts = {"2PT": 0, "3PT": 0}
     manifest: List[Dict[str, str | float | int]] = []
@@ -119,7 +140,20 @@ def _prepare_segments(
         if label == "3PT":
             counts["3PT"] += 1
 
-        dst_path, url = save_clip_as_uuid(tmp_out, member_id, highlight_key, subdir="shorts", prefix="short_")
+        try:
+            dst_path, url = save_clip_as_uuid(
+                tmp_out,
+                member_id,
+                highlight_key,
+                subdir="shorts",
+                prefix="short_",
+            )
+        except PermissionError as e:
+            raise AIHighlightError(
+                f"cannot save clips under SAVE_ROOT '{settings.SAVE_ROOT}': permission denied",
+                status_code=500,
+            ) from e
+                
         clips.append(dst_path)
         public_urls.append(url)
 
@@ -141,12 +175,22 @@ def _prepare_segments(
         merged_tmp = work_dir / f"{base_name}_merged_ai_demo.mp4"
         concat_videos([str(p) for p in clips], str(merged_tmp))
         annotate_inplace(str(merged_tmp), {"created_at": _now_iso()})
-        merged_dst, merged_url = save_clip_as_uuid(merged_tmp, member_id, highlight_key, subdir="shorts", prefix="merged_")
+        try:
+            merged_dst, merged_url = save_clip_as_uuid(
+                merged_tmp,
+                member_id,
+                highlight_key,
+                subdir="shorts",
+                prefix="merged_",
+            )
+        except PermissionError as e:
+            raise AIHighlightError(
+                f"cannot save merged clip under SAVE_ROOT '{settings.SAVE_ROOT}': permission denied",
+                status_code=500,
+            ) from e        
         clips.append(merged_dst)
         public_urls.append(merged_url)
-
-    dst_dir = Path(settings.SAVE_ROOT) / member_id / highlight_key
-    dst_dir.mkdir(parents=True, exist_ok=True)
+    
     summary = {
         "video_id": video_id,
         "member_id": member_id,
@@ -156,7 +200,13 @@ def _prepare_segments(
         "merged": merged_url,
     }
     summary_path = dst_dir / "summary.json"
-    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    except PermissionError as e:
+        raise AIHighlightError(
+            f"cannot write summary under SAVE_ROOT '{settings.SAVE_ROOT}': permission denied",
+            status_code=500,
+        ) from e    
 
     return AIHighlightResult(
         base_name=base_name,
@@ -198,4 +248,12 @@ def run_ai_demo_from_path(
 ) -> AIHighlightResult:
     if base_name is None:
         base_name = Path(src_path).stem
-    return _prepare_segments(Path(src_path), base_name, member_id, highlight_key, overlay_model_tag, merge_output, video_code)
+    return _prepare_segments(
+        Path(src_path),
+        base_name,
+        member_id,
+        highlight_key,
+        overlay_model_tag,
+        merge_output,
+        video_code,
+    )    

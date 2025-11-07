@@ -6,7 +6,7 @@
 from __future__ import annotations
 from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
-import os, importlib, hashlib, subprocess
+import os, importlib, hashlib, subprocess, runpy
 
 import cv2  # opencv-python-headless
 import numpy as np
@@ -83,30 +83,58 @@ def phash_distance(sig1: List[int], sig2: List[int]) -> int:
     return sum(hamming(sig1[i], sig2[i]) for i in range(m)) // m
 
 # ── 파이썬 레지스트리 로더 ───────────────────────────────────────
-def load_registry_from_py(module_path: str) -> Dict[str, Any]:
-    """
-    module_path 예: 'app.data.registry'
-    모듈은 아래 심볼을 제공해야 함:
-      - PLANS: List[dict]
-      - DURATION_TOLERANCE_SEC: float (optional, default 1.5)
-      - PHASH_HAMMING_THRESHOLD: int   (optional, default 6)
-    """
-    mod = importlib.import_module(module_path)
-    plans = getattr(mod, "PLANS")
-    tol = float(getattr(mod, "DURATION_TOLERANCE_SEC", 1.5))
-    thr = int(getattr(mod, "PHASH_HAMMING_THRESHOLD", 6))
+def _normalize_registry_payload(namespace: Dict[str, Any]) -> Dict[str, Any]:
+    if "PLANS" not in namespace:
+        raise ValueError("registry must define PLANS list")
+    plans = namespace["PLANS"]
+    tol = float(namespace.get("DURATION_TOLERANCE_SEC", 1.5))
+    thr = int(namespace.get("PHASH_HAMMING_THRESHOLD", 6))
     return {"plans": plans, "duration_tolerance_sec": tol, "phash_hamming_threshold": thr}
+
+
+def load_registry_from_py(module_path: str) -> Dict[str, Any]:
+    """module_path 예: 'app.data.registry'"""    
+    mod = importlib.import_module(module_path)
+    payload = {
+        key: getattr(mod, key)
+        for key in ("PLANS", "DURATION_TOLERANCE_SEC", "PHASH_HAMMING_THRESHOLD")
+        if hasattr(mod, key)
+    }
+    return _normalize_registry_payload(payload)
+
+
+def load_registry_from_file(file_path: str) -> Dict[str, Any]:
+    path = Path(file_path).expanduser()
+    if not path.is_absolute():
+        project_root = Path(__file__).resolve().parents[2]
+        candidate = (project_root / path).resolve()
+        if candidate.is_file():
+            path = candidate
+    if not path.is_file():
+        raise FileNotFoundError(f"registry file not found: {file_path}")
+    payload = runpy.run_path(str(path))
+    return _normalize_registry_payload(payload)    
 
 def load_registry() -> Dict[str, Any]:
     """
-    오직 파이썬 모듈만 지원.
+    PLAN_REGISTRY_PY 값이 '.py' 파일 경로나 모듈 경로 모두 가능하도록 로드한다.
     우선순위:
       1) 환경변수 PLAN_REGISTRY_PY
       2) settings.PLAN_REGISTRY_PY
       3) 기본값 'app.data.registry'
     """
-    py_mod = os.getenv("PLAN_REGISTRY_PY", "").strip() or getattr(settings, "PLAN_REGISTRY_PY", "") or "app.data.registry"
-    return load_registry_from_py(py_mod)
+    raw = os.getenv("PLAN_REGISTRY_PY", "").strip() or getattr(settings, "PLAN_REGISTRY_PY", "").strip()
+    if not raw:
+        raw = "app.data.registry"
+
+    looks_like_path = raw.endswith(".py") or "/" in raw or "\\" in raw or raw.startswith(".")
+    if looks_like_path:
+        try:
+            return load_registry_from_file(raw)
+        except FileNotFoundError:
+            # 파일 경로로 지정했지만 찾을 수 없는 경우만 모듈 시도로 폴백
+            pass
+    return load_registry_from_py(raw)
 
 # ── 매칭기 ────────────────────────────────────────────────────────
 class PlanRegistry:

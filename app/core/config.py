@@ -114,7 +114,9 @@ class Settings(BaseModel):
     PRESIGNED_EXPIRES_MIN: int = int(os.getenv("PRESIGNED_EXPIRES_MIN", "30") or "30")
     UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "/tmp/uploads")
     UPLOAD_CHUNK_MAX_MB: int = int(os.getenv("UPLOAD_CHUNK_MAX_MB", "0") or "0")
-    PLAN_REGISTRY_PY: str = os.getenv("PLAN_REGISTRY_PY", "")
+    # 기본 Plan registry 모듈 경로. 환경변수로 절대/상대 .py 파일 경로를 지정하면
+    # services.plan_registry 가 자동으로 처리한다.
+    PLAN_REGISTRY_PY: str = os.getenv("PLAN_REGISTRY_PY", "app.data.registry")
 
     # ─────────────────────────────────────────────────────────
     # ⬇⬇⬇ 이번 단계에 필요한 추가 설정(보강) ⬇⬇⬇
@@ -127,6 +129,13 @@ class Settings(BaseModel):
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://redis:6379/0")
     REDIS_UPLOAD_CHANNEL: str = os.getenv("REDIS_UPLOAD_CHANNEL", "upload_progress")
     REDIS_PROCESS_CHANNEL: str = os.getenv("REDIS_PROCESS_CHANNEL", "process_progress")
+        # 신규 진행률 채널명 (요구사항: opencv-progress-*)
+    REDIS_UPLOAD_PROGRESS_CHANNEL: str = os.getenv(
+        "REDIS_UPLOAD_PROGRESS_CHANNEL", "opencv-progress-upload"
+    )
+    REDIS_HIGHLIGHT_PROGRESS_CHANNEL: str = os.getenv(
+        "REDIS_HIGHLIGHT_PROGRESS_CHANNEL", "opencv-progress-highlight"
+    )
     PROGRESS_PUBLISH_INTERVAL_SEC: float = float(os.getenv("PROGRESS_PUBLISH_INTERVAL_SEC", "5") or "5")
     PROGRESS_INTERVAL_SEC: float = float(os.getenv("PROGRESS_INTERVAL_SEC", "5") or "5")
 
@@ -139,6 +148,11 @@ class Settings(BaseModel):
     # 최소 발행 스코어(필요 시 사용)
     PUBLISH_THRESHOLD: int = int(os.getenv("PUBLISH_THRESHOLD", "0") or "0")
     
+    # 하이라이트 완료 콜백(HTTP)
+    RESULT_CALLBACK_BASE_URL: str = os.getenv("RESULT_CALLBACK_BASE_URL", "")
+    RESULT_CALLBACK_PATH_TEMPLATE: str = os.getenv(
+        "RESULT_CALLBACK_PATH_TEMPLATE", "{jobId}"
+    )
     # ── (신규) FFmpeg 오버레이/출력 튜닝 ───────────────────────
     # Shorts 세로 해상도 (bh_edit에서 drawtext/scale용) — 코드 기본값은 1080x1920
     SHORTS_WIDTH: int = int(os.getenv("SHORTS_WIDTH", "1080"))
