@@ -10,5 +10,6 @@ anyio>=4.4.0
 pydantic>=2
 python-dotenv>=1.0.1
 aiofiles>=23.2.1
+cryptography>=42.0.0
 # optional:
 # hiredis>=2.3.2
