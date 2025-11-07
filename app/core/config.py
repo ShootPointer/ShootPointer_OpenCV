@@ -87,6 +87,13 @@ class Settings(BaseModel):
     # ✅ 두 이름 모두 지원: FF_HWACCEL(신규) 또는 FFMPEG_HWACCEL(기존)
     FF_HWACCEL: str = (os.getenv("FF_HWACCEL", "") or os.getenv("FFMPEG_HWACCEL", "")).strip().lower()
     FF_HWACCEL_DEVICE: str = (os.getenv("FF_HWACCEL_DEVICE", "") or os.getenv("FFMPEG_HWACCEL_DEVICE", "")).strip()
+    # 컷 실패 시 재인코드 여부 / 스레드 수 / 재인코드 파라미터
+    FFMPEG_CUT_FALLBACK_REENCODE: bool = _getenv_bool("FFMPEG_CUT_FALLBACK_REENCODE", False)
+    FFMPEG_THREADS: int = int(os.getenv("FFMPEG_THREADS", "0") or "0")
+    FFMPEG_REENC_VCODEC: str = os.getenv("FFMPEG_REENC_VCODEC", "libx264")
+    FFMPEG_REENC_PRESET: str = os.getenv("FFMPEG_REENC_PRESET", "veryfast")
+    FFMPEG_REENC_CRF: int = int(os.getenv("FFMPEG_REENC_CRF", "23") or "23")
+    FFMPEG_REENC_ACODEC: str = os.getenv("FFMPEG_REENC_ACODEC", "aac")
 
     # ── OpenCV CUDA 사용 옵션(옵션) ──────────────────────────
     # OpenCV가 CUDA로 빌드되어 있고 GPU가 있으면 True로 활성화, 아니면 자동 폴백
@@ -103,6 +110,11 @@ class Settings(BaseModel):
     CALLBACK_CONNECT_TIMEOUT: float = float(os.getenv("CALLBACK_CONNECT_TIMEOUT", "30"))
     CALLBACK_READ_TIMEOUT: float = float(os.getenv("CALLBACK_READ_TIMEOUT", "60"))
     CALLBACK_WRITE_TIMEOUT: float = float(os.getenv("CALLBACK_WRITE_TIMEOUT", "60"))
+    PRE_SIGNED_SECRET: str = os.getenv("PRE_SIGNED_SECRET", "")
+    PRESIGNED_EXPIRES_MIN: int = int(os.getenv("PRESIGNED_EXPIRES_MIN", "30") or "30")
+    UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "/tmp/uploads")
+    UPLOAD_CHUNK_MAX_MB: int = int(os.getenv("UPLOAD_CHUNK_MAX_MB", "0") or "0")
+    PLAN_REGISTRY_PY: str = os.getenv("PLAN_REGISTRY_PY", "")
 
     # ─────────────────────────────────────────────────────────
     # ⬇⬇⬇ 이번 단계에 필요한 추가 설정(보강) ⬇⬇⬇
@@ -113,6 +125,10 @@ class Settings(BaseModel):
     STATIC_BASE_URL: str = os.getenv("STATIC_BASE_URL", "https://your-domain/static/highlights")
     # Redis 연결 URL - 예: redis://redis:6379/0
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://redis:6379/0")
+    REDIS_UPLOAD_CHANNEL: str = os.getenv("REDIS_UPLOAD_CHANNEL", "upload_progress")
+    REDIS_PROCESS_CHANNEL: str = os.getenv("REDIS_PROCESS_CHANNEL", "process_progress")
+    PROGRESS_PUBLISH_INTERVAL_SEC: float = float(os.getenv("PROGRESS_PUBLISH_INTERVAL_SEC", "5") or "5")
+    PROGRESS_INTERVAL_SEC: float = float(os.getenv("PROGRESS_INTERVAL_SEC", "5") or "5")
 
     # 결과를 Redis Key/Value로 저장할지 여부 (백엔드가 GET으로 즉시 조회 가능)
     PUBLISH_RESULT_AS_KV: bool = _getenv_bool("PUBLISH_RESULT_AS_KV", True)
@@ -120,7 +136,9 @@ class Settings(BaseModel):
     RESULT_KEY_PREFIX: str = os.getenv("RESULT_KEY_PREFIX", "highlight-")
     # 결과 Key TTL(초). 0 이하면 만료 없음. 운영에선 1일(86400) 권장.
     RESULT_TTL_SECONDS: int = int(os.getenv("RESULT_TTL_SECONDS", "86400"))
-
+    # 최소 발행 스코어(필요 시 사용)
+    PUBLISH_THRESHOLD: int = int(os.getenv("PUBLISH_THRESHOLD", "0") or "0")
+    
     # ── (신규) FFmpeg 오버레이/출력 튜닝 ───────────────────────
     # Shorts 세로 해상도 (bh_edit에서 drawtext/scale용) — 코드 기본값은 1080x1920
     SHORTS_WIDTH: int = int(os.getenv("SHORTS_WIDTH", "1080"))
