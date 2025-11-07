@@ -146,4 +146,9 @@ class Settings(BaseModel):
     # Homography(RANSAC) 허용 오차
     HOMO_RANSAC_REPROJ_THRESH: float = float(os.getenv("HOMO_RANSAC_REPROJ_THRESH", "3.0"))
 
+    # ── Presigned 업로드 완료 후 AI 데모 자동 실행 ─────────────
+    AUTO_RUN_AI_DEMO: bool = _getenv_bool("AUTO_RUN_AI_DEMO", True)
+    AUTO_AI_DEMO_OVERLAY_TAG: str = os.getenv("AUTO_AI_DEMO_OVERLAY_TAG", "AI-Selector")
+    AUTO_AI_DEMO_MERGE_OUTPUT: bool = _getenv_bool("AUTO_AI_DEMO_MERGE_OUTPUT", True)
+
 settings = Settings()

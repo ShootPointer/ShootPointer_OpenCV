@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
 # ─────────────────────────────────────────────────────────────
 # 공통: 상수시간 비교 & 시크릿 선택
 # ─────────────────────────────────────────────────────────────
@@ -34,6 +35,7 @@ def _get_presigned_secret() -> str:
     if not sec:
         logger.warning("[crypto] PRE_SIGNED_SECRET/BACKEND_SECRET both empty")
     return sec
+
 # ─────────────────────────────────────────────────────────────
 # HEX 포맷 HMAC (레거시: 백엔드 서명 검증에 사용)
 # ─────────────────────────────────────────────────────────────

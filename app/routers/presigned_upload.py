@@ -24,6 +24,9 @@ from app.core.crypto import (
 from app.services.ffmpeg import get_duration  # 병합 후 길이 메타 계산
 
 logger = logging.getLogger(__name__)
+# Late imports to avoid matching issues with earlier comments
+from app.routers.ai_demo_runner import run_ai_demo_from_path, AIHighlightError
+import asyncio
 router = APIRouter(prefix="/api", tags=["upload"])
 # ─────────────────────────────────────────────────────────────
 # 공통 유틸
@@ -368,6 +371,81 @@ async def post_complete(
         )
     except Exception as e:
         logger.debug(f"[complete] progress publish skip: {e}")
+
+    # 4) (optional) Auto-run AI demo in background
+    try:
+        if getattr(settings, "AUTO_RUN_AI_DEMO", False):
+            async def _bg_run():
+                try:
+                    await ProgressBus.publish_kv(
+                        job_id=highlight_key,
+                        value={
+                            "type": PROGRESS_TYPE.PROCESSING_START,
+                            "stage": "AI_DEMO",
+                            "sourceUrl": public_url,
+                            "folder": ldt_path,
+                            "timestampMs": _now_ms(),
+                        },
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    result = await anyio.to_thread.run_sync(
+                        lambda: run_ai_demo_from_path(
+                            out_path,
+                            member_id=member_id,
+                            highlight_key=highlight_key,
+                            base_name=out_path.stem,
+                            overlay_model_tag=getattr(settings, "AUTO_AI_DEMO_OVERLAY_TAG", "AI-Selector"),
+                            merge_output=getattr(settings, "AUTO_AI_DEMO_MERGE_OUTPUT", True),
+                        )
+                    )
+                    try:
+                        await ProgressBus.publish_kv(
+                            job_id=highlight_key,
+                            value={
+                                "type": PROGRESS_TYPE.COMPLETE,
+                                "stage": "AI_DEMO",
+                                "summaryUrl": result.summary_url,
+                                "publicUrls": result.public_urls,
+                                "mergedUrl": result.merged_url,
+                                "counts": result.counts,
+                                "timestampMs": _now_ms(),
+                            },
+                        )
+                    except Exception:
+                        pass
+                except AIHighlightError as e:
+                    try:
+                        await ProgressBus.publish_kv(
+                            job_id=highlight_key,
+                            value={
+                                "type": PROGRESS_TYPE.COMPLETE,
+                                "stage": "AI_DEMO",
+                                "error": str(e),
+                                "timestampMs": _now_ms(),
+                            },
+                        )
+                    except Exception:
+                        pass
+                except Exception as e:
+                    try:
+                        await ProgressBus.publish_kv(
+                            job_id=highlight_key,
+                            value={
+                                "type": PROGRESS_TYPE.COMPLETE,
+                                "stage": "AI_DEMO",
+                                "error": f"unexpected: {e}",
+                                "timestampMs": _now_ms(),
+                            },
+                        )
+                    except Exception:
+                        pass
+
+            asyncio.create_task(_bg_run())
+    except Exception as e:
+        logger.debug(f"[complete] auto-run ai-demo skipped: {e}")
     # 4) 응답
     return _ok({
         "type": "UPLOAD_COMPLETE",
