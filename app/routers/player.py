@@ -1,4 +1,3 @@
-# app/routers/player.py
 from __future__ import annotations
 
 import logging
@@ -11,7 +10,7 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 
 from fastapi import (
-    APIRouter, UploadFile, File, Form, Request
+    APIRouter, UploadFile, File, Form, Request, HTTPException
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette import status
@@ -220,6 +219,23 @@ async def send_img(
             digits, conf = ocr_jersey_image_bytes(img_bytes)
 
         logger.info(f"[/send-img] OCR -> digits={digits!r}, conf={conf:.2f}, member={member_id}")
+
+        # [⭐ 수정/추가 부분 시작 ⭐]
+        # 3-1) 정확도(Confidence) 임계값 검사 로직 추가 (요청하신 0.5 아래 예외)
+        # settings.JERSEY_OCR_CONFIDENCE_THRESHOLD 가 없으면 기본값 0.5 사용
+        conf_threshold = getattr(settings, 'JERSEY_OCR_CONFIDENCE_THRESHOLD', 0.5)
+
+        # conf는 0.0 ~ 1.0 사이의 값으로 가정 (Tesseract의 Conf는 보통 0~100이지만, 서비스 레이어에서 0.0~1.0으로 정규화되었다고 가정)
+        if conf < conf_threshold:
+            logger.warning(f"[/send-img] OCR confidence ({conf:.2f}) below threshold ({conf_threshold:.2f})")
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                content={"status": "error", "step": "ocr_confidence_check", 
+                         "message": f"등번호 인식 정확도 ({conf:.2f})가 낮아 추출에 실패했습니다. (임계값: {conf_threshold:.2f})", 
+                         "memberId": member_id},
+            )
+        # [⭐ 수정/추가 부분 끝 ⭐]
+
         if not digits:
             return JSONResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -232,6 +248,14 @@ async def send_img(
             detected = int(digits)
         except Exception:
             detected = int(_digits_only(digits) or "0")
+        
+        # 0번은 유효하지 않은 등번호로 간주
+        if detected == 0:
+             return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                content={"status": "error", "step": step, "message": "유효하지 않은 등번호(0)가 인식되었습니다.", "memberId": member_id},
+            )
+
         JERSEY_CACHE[member_id] = detected
 
         match: Optional[bool] = None
@@ -254,6 +278,8 @@ async def send_img(
 
     except Exception as e:
         logger.exception(f"[/send-img] failed at step={step}: {e}")
+        # 최종 에러를 400 대신 500 또는 다른 적절한 에러로 처리할 수 있습니다.
+        # 현재는 기존 코드의 400을 유지합니다.
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
             content={"status": "error", "step": step, "message": str(e), "memberId": member_id},
