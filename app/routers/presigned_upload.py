@@ -96,6 +96,25 @@ _CHUNK_MAX_BYTES = int(getattr(settings, "UPLOAD_CHUNK_MAX_MB", 0) or 0) * 1024 
 UPLOAD_DIR = Path(getattr(settings, "UPLOAD_DIR", "/tmp/uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+# 업로드 세션 캐시 (첫 청크에서 복호화한 highlightKey/회원정보를 저장)
+_UPLOAD_REGISTRY: Dict[str, Tuple[str, str]] = {}
+_UPLOAD_REGISTRY_LOCK = asyncio.Lock()
+
+
+async def _remember_upload(upload_id: str, member_id: str, highlight_key: str) -> None:
+    async with _UPLOAD_REGISTRY_LOCK:
+        _UPLOAD_REGISTRY[upload_id] = (member_id, highlight_key)
+
+
+async def _recall_upload(upload_id: str) -> Optional[Tuple[str, str]]:
+    async with _UPLOAD_REGISTRY_LOCK:
+        return _UPLOAD_REGISTRY.get(upload_id)
+
+
+async def _forget_upload(upload_id: str) -> None:
+    async with _UPLOAD_REGISTRY_LOCK:
+        _UPLOAD_REGISTRY.pop(upload_id, None)
+
 # ─────────────────────────────────────────────────────────────
 # 에러 / 헬퍼 (Codex 패치 반영)
 # ─────────────────────────────────────────────────────────────
@@ -129,20 +148,38 @@ async def _store_chunk(
     expires: str,
     signature: str,
     member_id: str,
-    highlight_token: str,
+    highlight_token: Optional[str],
     chunk_iter: AsyncIterator[bytes],
     declared_size: Optional[int],
     content_sha256: Optional[str],
 ) -> Tuple[str, int]:
-    """
-    presigned 정보와 토큰을 검증하고, 청크를
-    /tmp/uploads/<uploadId>/part-000001 형태로 저장.
-    return: (highlight_key, received_size)
-    """
-    # highlightKey 토큰 검증
-    tok_ok, highlight_key = verify_highlight_token(highlight_token)
-    if not tok_ok:
-        raise ChunkUploadError(401, highlight_key)
+    """Presigned 정보와 토큰을 검증하고 청크를 저장한다."""
+
+    cached = await _recall_upload(upload_id)
+    highlight_key: Optional[str] = None
+
+    if highlight_token:
+        tok_ok, highlight_key = verify_highlight_token(highlight_token)
+        if not tok_ok:
+            raise ChunkUploadError(401, highlight_key)
+
+        if cached:
+            cached_member, cached_highlight = cached
+            if cached_member != member_id:
+                raise ChunkUploadError(403, "member mismatch")
+            if cached_highlight != highlight_key:
+                raise ChunkUploadError(409, "highlight token mismatch")
+
+        await _remember_upload(upload_id, member_id, highlight_key)
+    else:
+        if not cached:
+            raise ChunkUploadError(401, "highlight token required for first chunk")
+        cached_member, cached_highlight = cached
+        if cached_member != member_id:
+            raise ChunkUploadError(403, "member mismatch")
+        highlight_key = cached_highlight
+
+    assert highlight_key is not None
 
     # presigned 서명/만료 검증
     ok, reason = verify_chunk_signature_b64url(
@@ -282,8 +319,14 @@ def _parse_presigned_payload(presigned_raw: str, chunk_index: int) -> Dict[str, 
     except Exception:
         raise ChunkUploadError(422, "invalid partNumber")
 
-    if not upload_id or not expires or not signature or not member_id or not highlight_token:
+    if not upload_id or not expires or not signature or not member_id:    
         raise ChunkUploadError(400, "presigned payload missing required fields")
+
+    if not highlight_token:
+        if chunk_index <= 0:
+            raise ChunkUploadError(400, "highlightToken required for first chunk")
+    else:
+        highlight_token = str(highlight_token)
 
     return {
         "uploadId": str(upload_id),
@@ -291,7 +334,7 @@ def _parse_presigned_payload(presigned_raw: str, chunk_index: int) -> Dict[str, 
         "expires": str(expires),
         "signature": str(signature),
         "memberId": str(member_id),
-        "highlightToken": str(highlight_token),
+        "highlightToken": highlight_token,
         "contentSha256": str(content_sha256) if content_sha256 else None,
     }
 
@@ -626,7 +669,7 @@ async def put_chunk(
     expires: str,
     signature: str,
     x_member_id: str = Header(..., alias="x-member-id"),
-    x_highlight_token: str = Header(..., alias="x-highlight-key"),
+    x_highlight_token: str | None = Header(None, alias="x-highlight-key"),
     x_content_sha256: str | None = Header(None, alias="x-content-sha256"),
 ):
     # partNumber 검증
@@ -745,7 +788,7 @@ async def post_chunk_form(
             expires=parsed["expires"],
             signature=parsed["signature"],
             member_id=parsed["memberId"],
-            highlight_token=parsed["highlightToken"],
+            highlight_token=parsed.get("highlightToken"),
             chunk_iter=chunk_iter,
             declared_size=declared_size,
             content_sha256=parsed.get("contentSha256"),
@@ -830,18 +873,52 @@ async def post_complete(
     file_name = str(payload.get("fileName", "")).strip()
     total_bytes_decl: int | None = payload.get("totalBytes")
 
-    if not (member_id and highlight_token and file_name):
+    if not (member_id and file_name):
         return JSONResponse(
             status_code=400,
-            content={"status": "error", "message": "memberId/highlightKey/fileName required"},
+            content={"status": "error", "message": "memberId/fileName required"},
         )
 
-    tok_ok, highlight_key = verify_highlight_token(highlight_token)
-    if not tok_ok:
-        return JSONResponse(
-            status_code=401,
-            content={"status": "error", "message": highlight_key},
-        )
+    cached = await _recall_upload(x_upload_id)
+    highlight_key: Optional[str] = None
+
+    if highlight_token:
+        tok_ok, highlight_key = verify_highlight_token(highlight_token)
+        if not tok_ok:
+            return JSONResponse(
+                status_code=401,
+                content={"status": "error", "message": highlight_key},
+            )
+
+        if cached:
+            cached_member, cached_highlight = cached
+            if cached_member != member_id:
+                return JSONResponse(
+                    status_code=403,
+                    content={"status": "error", "message": "member mismatch"},
+                )
+            if cached_highlight != highlight_key:
+                return JSONResponse(
+                    status_code=409,
+                    content={"status": "error", "message": "highlight token mismatch"},
+                )
+
+        await _remember_upload(x_upload_id, member_id, highlight_key)
+    else:
+        if not cached:
+            return JSONResponse(
+                status_code=401,
+                content={"status": "error", "message": "highlightKey required"},
+            )
+        cached_member, cached_highlight = cached
+        if cached_member != member_id:
+            return JSONResponse(
+                status_code=403,
+                content={"status": "error", "message": "member mismatch"},
+            )
+        highlight_key = cached_highlight
+
+    assert highlight_key is not None    
 
     # 1) 완료 서명 검증
     ok, reason = verify_complete_signature_b64url(
@@ -923,6 +1000,8 @@ async def post_complete(
             )
         except RuntimeError as e:
             logger.warning(f"[complete] auto ai-demo scheduling failed: {e}")
+
+    await _forget_upload(x_upload_id)
 
     # 6) 응답
     return _ok({

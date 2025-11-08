@@ -31,9 +31,10 @@ RESULT_DIR.mkdir(parents=True, exist_ok=True)
 # 간단 Job 상태 메모리 저장소
 # ─────────────────────────
 class JobState:
-    def __init__(self, upload_id: str, member_id: str):
+    def __init__(self, upload_id: str, member_id: str, highlight_key: Optional[str] = None):
         self.uploadId = upload_id
         self.memberId = member_id
+        self.highlightKey = highlight_key
         self.status: str = "queued"       # queued|running|done|error
         self.progress: float = 0.0        # 0.0~100.0
         self.message: str = ""
@@ -47,8 +48,20 @@ JOBS: Dict[str, JobState] = {}
 # ─────────────────────────
 # 유틸
 # ─────────────────────────
-def _find_uploaded(member_id: str, upload_id: str) -> Optional[Path]:
-    # presigned_upload.py가 저장한 규칙: {memberId}_{uploadId}.mp4
+def _find_uploaded(member_id: str, upload_id: str, highlight_key: Optional[str] = None) -> Optional[Path]:
+    # ✅ 새로운 저장 규칙: SAVE_ROOT/{memberId}/{highlightKey}/localDateTime/original_*.mp4
+    if highlight_key:
+        root = Path(settings.SAVE_ROOT) / member_id / highlight_key
+        if root.is_dir():
+            candidates = sorted(
+                root.glob("*/original_*.mp4"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if candidates:
+                return candidates[0]
+
+    # ⬇ 레거시 호환: presigned_upload.py가 저장한 규칙: {memberId}_{uploadId}.mp4
     cand = UPLOAD_DIR / f"{member_id}_{upload_id}.mp4"
     return cand if cand.exists() else None
 
@@ -70,6 +83,8 @@ async def _notify(job: JobState, progress_url: Optional[str], completed_url: Opt
         "message": job.message,
         "requestId": job.requestId,
     }
+    if job.highlightKey:
+        payload["highlightKey"] = job.highlightKey
     if job.status == "done":
         payload["downloadUrl"] = f"/api/process/{job.uploadId}/result"  # OpenCV 서버의 다운로드 엔드포인트
     url = completed_url if job.status == "done" and completed_url else progress_url
@@ -91,7 +106,7 @@ async def _run_job(job: JobState, progress_url: Optional[str], completed_url: Op
         job.status = "running"
         _set_progress(job, 1.0, "locating-upload")
 
-        src = _find_uploaded(job.memberId, job.uploadId)
+        src = _find_uploaded(job.memberId, job.uploadId, job.highlightKey)
         if not src:
             raise FileNotFoundError("uploaded video not found")
         job.videoPath = src
@@ -164,6 +179,10 @@ async def start_process(
     background: BackgroundTasks,
     uploadId: str,
     memberId: str = Query(..., description="멤버 식별자"),
+    highlightKey: Optional[str] = Query(
+        None,
+        description="선택: Presigned 업로드에서 사용한 highlightKey (SAVE_ROOT 탐색용)",
+    ),
     maxClips: int = Query(settings.MAX_CLIPS, description="최대 클립 수"),
     body: dict = Body(
         default={},
@@ -176,7 +195,7 @@ async def start_process(
     - 비동기로 처리 시작 → 즉시 202 응답
     """
     req_id = uuid.uuid4().hex[:8]
-    job = JobState(uploadId, memberId)
+    job = JobState(uploadId, memberId, highlight_key=highlightKey)
     job.requestId = req_id
     JOBS[uploadId] = job
 
@@ -191,13 +210,18 @@ async def start_process(
 
     # 백그라운드 실행
     background.add_task(_run_job, job, progress_url, completed_url, maxClips)
-    return JSONResponse(status_code=202, content={
+    response_payload = {
         "status": 202,
         "success": True,
         "uploadId": uploadId,
         "memberId": memberId,
-        "requestId": req_id
-    })
+        "requestId": req_id,
+    }
+    if highlightKey:
+        response_payload["highlightKey"] = highlightKey
+
+    return JSONResponse(status_code=202, content=response_payload)
+
 
 @router.get("/process/{uploadId}/status", summary="Get processing status")
 async def get_status(uploadId: str):
