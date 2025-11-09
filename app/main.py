@@ -1,4 +1,3 @@
-# app/main.py
 from __future__ import annotations
 
 import logging
@@ -18,9 +17,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.config import settings
 from app.core.logging import setup_logging
-from app.routers import upload, highlight, player, frames
-from app.routers import presigned_upload, process
-from app.routers import ai_demo  # ✅ 데모 하이라이트 라우터
+# ⬇️ 수정: upload를 제거하고 모든 라우터를 한 줄로 정리
+from app.routers import highlight, player, frames, presigned_upload, process, ai_demo
+# ⬆️ 수정
 
 # ─────────────────────────────────────────────────────────────
 # 로깅 초기화
@@ -159,7 +158,7 @@ def _check_static_mount() -> dict:
 # 정적 파일 서빙 마운트
 #   - STATIC_BASE_URL의 path를 FastAPI에 매핑
 #   - 예: STATIC_BASE_URL = "http://tkv0011.ddns.net:8000/static/highlights"
-#       -> path "/static/highlights" 를 SAVE_ROOT에 연결
+#     -> path "/static/highlights" 를 SAVE_ROOT에 연결
 # ─────────────────────────────────────────────────────────────
 parsed = urlparse(settings.STATIC_BASE_URL)
 static_path = parsed.path or "/static/highlights"
@@ -240,7 +239,7 @@ def health():
 # ─────────────────────────────────────────────────────────────
 # 라우터 등록
 # ─────────────────────────────────────────────────────────────
-app.include_router(upload.router)
+# app.include_router(upload.router) # ⬅️ 제거됨
 app.include_router(highlight.router)
 app.include_router(player.router)
 app.include_router(frames.router)

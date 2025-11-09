@@ -1,5 +1,5 @@
-# 패키지 내 하위 모듈을 가져올 수 있도록 명시
-from . import upload, highlight, player, frames, presigned_upload, process
+from . import highlight, player, frames, presigned_upload, process
 from . import highlight_url 
 
-__all__ = ["upload", "highlight", "player", "frames"]
+# 'upload' 라우터를 제거하고, 새로 사용되는 라우터들을 __all__에 명시합니다.
+__all__ = ["highlight", "player", "frames", "presigned_upload", "process", "highlight_url"]

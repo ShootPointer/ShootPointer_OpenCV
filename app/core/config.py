@@ -1,7 +1,7 @@
-# app/core/config.py
 from __future__ import annotations
 import os
 from pydantic import BaseModel
+
 
 def _getenv_bool(key: str, default: bool = False) -> bool:
     """환경변수 불리언 파싱: '1','true','yes','y','on' → True (대소문자 무시)"""
@@ -51,10 +51,10 @@ class Settings(BaseModel):
     AUTO_TOPK: int = int(os.getenv("AUTO_TOPK", "5"))
 
     # ── 등번호 감지 파라미터(OpenCV + Tesseract) ─────────────
-    JERSEY_SAMPLE_FPS: float = float(os.getenv("JERSEY_SAMPLE_FPS", "1.5"))   # 초당 샘플 프레임
+    JERSEY_SAMPLE_FPS: float = float(os.getenv("JERSEY_SAMPLE_FPS", "1.5"))  # 초당 샘플 프레임
     JERSEY_MIN_SEG_DUR: float = float(os.getenv("JERSEY_MIN_SEG_DUR", "1.2")) # 최소 구간 길이(초)
-    JERSEY_MERGE_GAP: float = float(os.getenv("JERSEY_MERGE_GAP", "2.0"))     # 인접 구간 병합 간격(초)
-    JERSEY_NUM_CONF: float = float(os.getenv("JERSEY_NUM_CONF", "0.5"))       # 숫자 신뢰도 하한(0~1)
+    JERSEY_MERGE_GAP: float = float(os.getenv("JERSEY_MERGE_GAP", "2.0"))    # 인접 구간 병합 간격(초)
+    JERSEY_NUM_CONF: float = float(os.getenv("JERSEY_NUM_CONF", "0.5"))      # 숫자 신뢰도 하한(0~1)
 
     # ── OCR / Tesseract ───────────────────────────────────────
     # 단일 PSM(레거시 호환). 예: "7" (한 줄)
@@ -76,8 +76,8 @@ class Settings(BaseModel):
     OCR_MAX_SEC: float = float(os.getenv("OCR_MAX_SEC", "8.0"))
 
     # ── 실행/로깅/안정화 ─────────────────────────────────────
-    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")                           # DEBUG/INFO/WARNING/ERROR
-    REQUEST_LOG_BODY: bool = _getenv_bool("REQUEST_LOG_BODY", False)          # 대용량 업로드 대비 False 권장
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")                            # DEBUG/INFO/WARNING/ERROR
+    REQUEST_LOG_BODY: bool = _getenv_bool("REQUEST_LOG_BODY", False)        # 대용량 업로드 대비 False 권장
     # 서브프로세스(FFmpeg 등) 타임아웃(초)
     FFMPEG_TIMEOUT_SEC: int = int(os.getenv("FFMPEG_TIMEOUT_SEC", "120"))
     # 업로드 최대 크기(바이트). 0 또는 미설정이면 제한 없음 (기본 200MB)
@@ -106,14 +106,23 @@ class Settings(BaseModel):
     ALLOW_ORIGINS: str = os.getenv("ALLOW_ORIGINS", "*")
 
     # ── 백엔드 콜백/전달(저장 없이 즉시 업로드) ───────────────
-    BACKEND_SECRET: str = os.getenv("BACKEND_SECRET", "")                     # 백엔드-서버 공유 시크릿(없으면 검증 생략)
+    BACKEND_SECRET: str = os.getenv("BACKEND_SECRET", "")  # 백엔드-서버 공유 시크릿(없으면 검증 생략)
     CALLBACK_CONNECT_TIMEOUT: float = float(os.getenv("CALLBACK_CONNECT_TIMEOUT", "30"))
     CALLBACK_READ_TIMEOUT: float = float(os.getenv("CALLBACK_READ_TIMEOUT", "60"))
     CALLBACK_WRITE_TIMEOUT: float = float(os.getenv("CALLBACK_WRITE_TIMEOUT", "60"))
+    
+    # ⬇⬇⬇ 청크 업로드 및 암호화/복호화에 필요한 키 (수정됨) ⬇⬇⬇
+    # crypto.py에서 사용할 AES-GCM 복호화 키 (PRE_SIGNED_SECRET이 아니라 AES_GCM_SECRET을 환경변수에서 읽습니다.)
+    AES_GCM_SECRET: str = os.getenv("AES_GCM_SECRET", "") 
+    # 기존 PRE_SIGNED_SECRET 변수는 그대로 유지 (다른 곳에서 사용될 수 있으므로)
     PRE_SIGNED_SECRET: str = os.getenv("PRE_SIGNED_SECRET", "")
+    # ⬆⬆⬆ 청크 업로드 및 암호화/복호화에 필요한 키 (수정됨) ⬆⬆⬆
+
     PRESIGNED_EXPIRES_MIN: int = int(os.getenv("PRESIGNED_EXPIRES_MIN", "30") or "30")
     UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "/tmp/uploads")
     UPLOAD_CHUNK_MAX_MB: int = int(os.getenv("UPLOAD_CHUNK_MAX_MB", "0") or "0")
+    # ↓ 추가 (TEMP_ROOT가 없어서 크래시 나니, UPLOAD_DIR을 기본으로 물려주기)
+    TEMP_ROOT: str = os.getenv("TEMP_ROOT", UPLOAD_DIR)
     # 기본 Plan registry 모듈 경로. 환경변수로 절대/상대 .py 파일 경로를 지정하면
     # services.plan_registry 가 자동으로 처리한다.
     PLAN_REGISTRY_PY: str = os.getenv("PLAN_REGISTRY_PY", "app.data.registry")
@@ -121,7 +130,7 @@ class Settings(BaseModel):
     # ─────────────────────────────────────────────────────────
     # ⬇⬇⬇ 이번 단계에 필요한 추가 설정(보강) ⬇⬇⬇
     # ─────────────────────────────────────────────────────────
-    # 파일 저장 루트 (컨테이너 내부 경로) - 예: /data/highlights
+    # 파일 저장 루트 (컨테이너 내부 경로) - job_id 폴더가 이 아래에 생성됩니다.
     SAVE_ROOT: str = os.getenv("SAVE_ROOT", "/data/highlights")
     # 외부에서 접근할 정적 URL 베이스 - 예: https://your-domain/static/highlights
     STATIC_BASE_URL: str = os.getenv("STATIC_BASE_URL", "https://your-domain/static/highlights")
