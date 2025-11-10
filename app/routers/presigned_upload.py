@@ -4,7 +4,7 @@ import logging
 import shutil
 import base64
 from pathlib import Path
-from typing import Annotated, Optional # Optional (또는 | None) import
+from typing import Annotated, Optional
 
 # 🚨 수정: File, UploadFile 제거 (Form만 사용)
 from fastapi import APIRouter, Depends, Form, HTTPException, BackgroundTasks
@@ -67,8 +67,8 @@ async def upload_presigned_chunk(
     background_tasks: BackgroundTasks,
 
     # ⬇⬇ 기본값 있는 파라미터들 (Form)
-    # 🚨 수정: file: UploadFile 대신 base64Chunk: str로 Base64 문자열을 Form으로 받음
-    base64Chunk: str = Form(..., description="Base64 인코딩된 청크 문자열"),
+    # 🚨 수정: 필드 이름을 'file'로 유지하되, 타입은 str = Form(...)으로 변경하여 Base64 문자열을 받음.
+    file: str = Form(..., description="Base64 인코딩된 청크 문자열 (클라이언트 필드명 'file'과 일치)"),
     
     chunkIndex: int = Form(..., ge=1, description="현재 청크 번호 (1부터 시작)"),
     totalParts: int = Form(..., ge=1, description="전체 청크 개수"),
@@ -78,7 +78,6 @@ async def upload_presigned_chunk(
     """
     클라이언트로부터 Base64 인코딩된 청크를 받아 디코딩 및 저장
     """
-    # Optional 타입 힌트를 위한 변수 선언
     job_id: str | None = None
     token_file_name: str | None = None
     
@@ -107,12 +106,12 @@ async def upload_presigned_chunk(
             )
 
         # 3) Base64 데이터 디코딩
-        base64_str = base64Chunk # 🚨 수정: Form으로 받은 문자열 변수를 사용
+        base64_str = file # 🚨 수정: 'file' 변수는 이제 Base64 문자열을 담고 있음
         try:
             if not base64_str.strip():
                 raise ValueError("empty base64 payload")
                 
-            # 강력한 유틸리티 함수를 사용하여 디코딩
+            # 유틸리티 함수를 사용하여 디코딩
             chunk_binary_data = _b64_any_decode(base64_str)
         except Exception as e:
             logger.error(f"Base64 decoding failed for chunk {chunkIndex} (Job {job_id}): {e}")
@@ -160,7 +159,7 @@ async def complete_presigned_upload(
     청크 완료 확인 → 병합 → AI 처리 트리거 (Placeholder 유지)
     """
     job_id: str | None = None
-    chunk_dir: Path | None = None # Path 타입 힌트
+    chunk_dir: Path | None = None
     try:
         # 1) 토큰 복호화/검증
         try:
