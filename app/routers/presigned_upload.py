@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import logging
 import shutil
-import base64  # Base64 디코딩을 위해 추가
+import base64
 from pathlib import Path
 from typing import Annotated
-from io import BytesIO  # 메모리 상에서 바이너리 처리를 위해 추가
 
 from fastapi import APIRouter, Depends, Form, File, UploadFile, HTTPException, BackgroundTasks
-from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.core.crypto import AESGCMCrypto, DecryptedToken, get_crypto_service
@@ -17,18 +15,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # ─────────────────────────────────────────────────────────────
-# Pydantic 폼 데이터 스키마 (BaseModel은 Form에 필요 없음)
-# ─────────────────────────────────────────────────────────────
-
-# (ChunkUploadForm, CompleteUploadForm은 사용되지 않으므로 제거)
-
-# ─────────────────────────────────────────────────────────────
 # 비동기 AI 데모 트리거 (placeholder)
 # ─────────────────────────────────────────────────────────────
 
 def trigger_ai_demo(job_id: str, final_path: Path) -> None:
     """
-    원본 영상 저장 완료 후 Redis Queue에 작업을 추가하는 로직으로 대체될 예정입니다.
+    원본 영상 저장 완료 후 다음 단계로 넘어가는 placeholder 함수입니다.
     """
     try:
         # TODO: Redis 큐에 job_id와 final_path를 push하는 실제 로직으로 대체해야 합니다.
@@ -54,7 +46,6 @@ async def upload_presigned_chunk(
     background_tasks: BackgroundTasks,
 
     # ⬇⬇ 기본값 있는 파라미터들 (Form/File)
-    # file: UploadFile을 그대로 사용하지만, 데이터는 Base64 문자열로 기대합니다.
     file: UploadFile = File(..., description="Base64 인코딩된 청크 데이터"),
     chunkIndex: int = Form(..., ge=1, description="현재 청크 번호 (1부터 시작)"),
     totalParts: int = Form(..., ge=1, description="전체 청크 개수"),
@@ -64,27 +55,37 @@ async def upload_presigned_chunk(
     """
     클라이언트로부터 Base64 인코딩된 청크를 받아 디코딩 및 저장
     """
+    job_id = None
+    token_file_name = None
     try:
         # 1) 토큰 복호화/검증
-        token_data: DecryptedToken = crypto.decrypt_token(presignedToken)
-        job_id = token_data.jobId
-        token_file_name = token_data.fileName
+        try:
+            token_data: DecryptedToken = crypto.decrypt_token(presignedToken)
+            job_id = token_data.jobId
+            token_file_name = token_data.fileName
+        except ValueError as e:
+            # 🚨 JSON serializable 오류를 방지하기 위해 ValueError 발생 시 HTTPException으로 변환 (핵심 수정)
+            logger.error(f"Token validation failed (ValueError): {e}")
+            raise HTTPException(status_code=401, detail=f"Invalid or expired token: {str(e)}")
+
 
         # 2) fileName 일치 검증
         if fileName != token_file_name:
+            logger.error(f"Filename mismatch for Job {job_id}: Token expects '{token_file_name}', received '{fileName}'")
             raise HTTPException(
                 status_code=400,
                 detail=f"Filename mismatch: Token expects '{token_file_name}', received '{fileName}'",
             )
         
-        # 3) Base64 데이터 읽기 및 디코딩 (핵심 수정 부분)
-        base64_data: bytes = await file.read() # UploadFile을 읽으면 Base64 문자열(Bytes)이 나옴
+        # 3) Base64 데이터 읽기 및 디코딩
+        base64_data: bytes = await file.read() 
         
         try:
             # Base64 문자열을 실제 바이너리 데이터로 디코딩
             chunk_binary_data = base64.b64decode(base64_data.strip())
         except (ValueError, Exception) as e:
-            logger.error(f"Base64 decoding failed for chunk {chunkIndex}: {e}")
+            # Base64 디코딩 실패 시 400 Bad Request 및 로그 기록
+            logger.error(f"Base64 decoding failed for chunk {chunkIndex} (Job {job_id}): {e}")
             raise HTTPException(status_code=400, detail="Invalid Base64 data received in chunk.")
 
 
@@ -102,12 +103,13 @@ async def upload_presigned_chunk(
         logger.info(f"Chunk {chunkIndex}/{totalParts} saved for Job ID: {job_id}")
         return {"message": "Chunk uploaded successfully", "jobId": job_id, "chunkIndex": chunkIndex}
 
-    except ValueError as e:
-        # 토큰 검증 오류 (만료, 무결성 실패 등)
-        raise HTTPException(status_code=401, detail=str(e))
+    except HTTPException:
+        # HTTPException은 그대로 재발생
+        raise
     except Exception as e:
-        logger.error(f"Error during chunk upload: {e}")
-        # 임시 디렉토리 정리 로직은 나중에 complete에서 처리
+        # 그 외 모든 예상치 못한 오류에 대해 500 응답
+        logger.error(f"Unexpected Error during chunk upload: {e}", exc_info=True)
+        # JSON 직렬화 오류를 피하기 위해 HTTPException으로 변환하여 반환
         raise HTTPException(status_code=500, detail="Internal server error during upload")
 
 @router.post("/complete")
@@ -115,19 +117,28 @@ async def complete_presigned_upload(
     # ⬇⬇ 기본값 없는 파라미터 먼저
     crypto: CryptoDep,
     background_tasks: BackgroundTasks,
+    # redis_service: RedisDep, # Redis 의존성 제거됨
 
     # ⬇⬇ 기본값 있는 Form 파라미터들
     totalParts: int = Form(..., ge=1, description="전체 청크 개수"),
     presignedToken: str = Form(..., description="AES-GCM 복호화 가능한 토큰"),
 ):
     """
-    청크 완료 확인 → 병합 → AI 처리 트리거
+    청크 완료 확인 → 병합 → AI 처리 트리거 (Placeholder 유지)
     """
+    job_id = None
+    chunk_dir = None
     try:
         # 1) 토큰 복호화/검증
-        token_data: DecryptedToken = crypto.decrypt_token(presignedToken)
-        job_id = token_data.jobId
-        file_name = token_data.fileName
+        try:
+            token_data: DecryptedToken = crypto.decrypt_token(presignedToken)
+            job_id = token_data.jobId
+            file_name = token_data.fileName
+        except ValueError as e:
+            # 🚨 JSON serializable 오류를 방지하기 위해 ValueError 발생 시 HTTPException으로 변환 (핵심 수정)
+            logger.error(f"Token validation failed in /complete: {e}")
+            raise HTTPException(status_code=401, detail=f"Invalid or expired token: {str(e)}")
+
 
         chunk_dir = settings.TEMP_ROOT / job_id
         if not chunk_dir.exists():
@@ -147,7 +158,6 @@ async def complete_presigned_upload(
             )
 
         # 3) 병합
-        # settings.SAVE_ROOT 대신 확정된 ORIGINAL_VIDEO_ROOT 사용
         final_path = settings.ORIGINAL_VIDEO_ROOT / f"{job_id}_{file_name}"
         final_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -161,15 +171,18 @@ async def complete_presigned_upload(
         # 4) 임시 청크 폴더 정리
         shutil.rmtree(chunk_dir)
 
-        # 5) AI 데모 비동기 시작 (Redis 큐 로직으로 대체 예정)
+        # 5) AI 데모 비동기 시작 (Placeholder 유지)
         background_tasks.add_task(trigger_ai_demo, job_id, final_path)
+        logger.info(f"AI processing successfully initiated (via background task).")
 
         return {"message": "Upload complete, file merged, and AI processing initiated", "jobId": job_id}
 
-    except ValueError as e:
-        raise HTTPException(status_code=401, detail=str(e))
+    except HTTPException:
+        # HTTPException은 그대로 재발생
+        raise
     except Exception as e:
         logger.error(f"Error during completion: {e}")
-        if 'chunk_dir' in locals() and chunk_dir.exists():
+        if 'chunk_dir' in locals() and chunk_dir and chunk_dir.exists():
             shutil.rmtree(chunk_dir, ignore_errors=True)
+        # JSON 직렬화 오류를 피하기 위해 HTTPException으로 변환하여 반환
         raise HTTPException(status_code=500, detail="Internal server error during file merge")
