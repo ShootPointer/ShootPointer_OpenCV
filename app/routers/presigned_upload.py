@@ -1,13 +1,13 @@
-# app/routers/presigned_upload.py
 from __future__ import annotations
 
 import logging
 import shutil
 import base64
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Optional # Optional (또는 | None) import
 
-from fastapi import APIRouter, Depends, Form, File, UploadFile, HTTPException, BackgroundTasks
+# 🚨 수정: File, UploadFile 제거 (Form만 사용)
+from fastapi import APIRouter, Depends, Form, HTTPException, BackgroundTasks
 
 from app.core.config import settings
 from app.core.crypto import AESGCMCrypto, DecryptedToken, get_crypto_service
@@ -47,7 +47,11 @@ def _b64_any_decode(s: str) -> bytes:
     # data URL prefix 제거 대응 (ex: "data:application/octet-stream;base64,AAAA...")
     if "," in s and s.lstrip().lower().startswith("data:"):
         s = s.split(",", 1)[1].strip()
+    
+    # Base64 패딩 보정 (4의 배수)
     pad = "=" * ((4 - (len(s) % 4)) % 4)
+    
+    # URL-safe 먼저 시도 후, 실패 시 표준 Base64 시도
     try:
         return base64.urlsafe_b64decode(s + pad)
     except Exception:
@@ -62,8 +66,10 @@ async def upload_presigned_chunk(
     crypto: CryptoDep,
     background_tasks: BackgroundTasks,
 
-    # ⬇⬇ 기본값 있는 파라미터들 (Form/File)
-    file: UploadFile = File(..., description="Base64 인코딩된 청크 데이터"),
+    # ⬇⬇ 기본값 있는 파라미터들 (Form)
+    # 🚨 수정: file: UploadFile 대신 base64Chunk: str로 Base64 문자열을 Form으로 받음
+    base64Chunk: str = Form(..., description="Base64 인코딩된 청크 문자열"),
+    
     chunkIndex: int = Form(..., ge=1, description="현재 청크 번호 (1부터 시작)"),
     totalParts: int = Form(..., ge=1, description="전체 청크 개수"),
     presignedToken: str = Form(..., description="AES-GCM 복호화 가능한 토큰"),
@@ -72,9 +78,15 @@ async def upload_presigned_chunk(
     """
     클라이언트로부터 Base64 인코딩된 청크를 받아 디코딩 및 저장
     """
+    # Optional 타입 힌트를 위한 변수 선언
     job_id: str | None = None
     token_file_name: str | None = None
+    
     try:
+        # 0) 유효성 검사 추가 (chunkIndex와 totalParts는 FastAPI/Pydantic이 이미 검사함)
+        if chunkIndex > totalParts:
+            raise HTTPException(status_code=400, detail="chunkIndex cannot be greater than totalParts.")
+
         # 1) 토큰 복호화/검증
         try:
             token_data: DecryptedToken = crypto.decrypt_token(presignedToken)
@@ -94,12 +106,13 @@ async def upload_presigned_chunk(
                 detail=f"Filename mismatch: Token expects '{token_file_name}', received '{fileName}'",
             )
 
-        # 3) Base64 데이터 읽기 및 디코딩
-        base64_bytes: bytes = await file.read()
+        # 3) Base64 데이터 디코딩
+        base64_str = base64Chunk # 🚨 수정: Form으로 받은 문자열 변수를 사용
         try:
-            base64_str = base64_bytes.decode("utf-8", errors="ignore").strip()
-            if not base64_str:
+            if not base64_str.strip():
                 raise ValueError("empty base64 payload")
+                
+            # 강력한 유틸리티 함수를 사용하여 디코딩
             chunk_binary_data = _b64_any_decode(base64_str)
         except Exception as e:
             logger.error(f"Base64 decoding failed for chunk {chunkIndex} (Job {job_id}): {e}")
@@ -127,6 +140,7 @@ async def upload_presigned_chunk(
         return {"message": "Chunk uploaded successfully", "jobId": job_id, "chunkIndex": chunkIndex}
 
     except HTTPException:
+        # HTTPException은 그대로 재발생
         raise
     except Exception as e:
         logger.error(f"Unexpected Error during chunk upload: {e}", exc_info=True)
@@ -146,7 +160,7 @@ async def complete_presigned_upload(
     청크 완료 확인 → 병합 → AI 처리 트리거 (Placeholder 유지)
     """
     job_id: str | None = None
-    chunk_dir: Path | None = None
+    chunk_dir: Path | None = None # Path 타입 힌트
     try:
         # 1) 토큰 복호화/검증
         try:
@@ -199,6 +213,7 @@ async def complete_presigned_upload(
         raise
     except Exception as e:
         logger.error(f"Error during completion: {e}")
-        if chunk_dir and chunk_dir.exists():
-            shutil.rmtree(chunk_dir, ignore_errors=True)
+        # chunk_dir이 정의되었고 존재하는 경우에만 정리 시도
+        if 'chunk_dir' in locals() and chunk_dir and chunk_dir.exists():
+             shutil.rmtree(chunk_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail="Internal server error during file merge")
