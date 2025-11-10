@@ -1,33 +1,20 @@
+# app/routers/presigned_upload.py
+
 from __future__ import annotations
 
 import logging
-import shutil
 import base64
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated
 
-# 🚨 수정: File, UploadFile 제거 (Form만 사용)
 from fastapi import APIRouter, Depends, Form, HTTPException, BackgroundTasks
 
 from app.core.config import settings
 from app.core.crypto import AESGCMCrypto, DecryptedToken, get_crypto_service
+from app.services.file_manager import merge_chunks_and_cleanup, chunk_saved_progress # 파일 I/O 및 진행률 알림 위임
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-# ─────────────────────────────────────────────────────────────
-# 비동기 AI 데모 트리거 (placeholder)
-# ─────────────────────────────────────────────────────────────
-def trigger_ai_demo(job_id: str, final_path: Path) -> None:
-    """
-    원본 영상 저장 완료 후 다음 단계로 넘어가는 placeholder 함수입니다.
-    """
-    try:
-        # TODO: 실제 큐/잡 트리거 로직으로 교체
-        logger.info(f"AI Demo Triggered (Placeholder) for Job ID: {job_id}. Source: {final_path}")
-        logger.info(f"AI processing successfully initiated for {job_id}")
-    except Exception as e:
-        logger.error(f"Failed to trigger AI demo for {job_id}: {e}")
 
 # ─────────────────────────────────────────────────────────────
 # Depends 타입 별칭
@@ -44,7 +31,7 @@ def _b64_any_decode(s: str) -> bytes:
     s = s.strip()
     if not s:
         return b""
-    # data URL prefix 제거 대응 (ex: "data:application/octet-stream;base64,AAAA...")
+    # data URL prefix 제거 대응
     if "," in s and s.lstrip().lower().startswith("data:"):
         s = s.split(",", 1)[1].strip()
     
@@ -57,19 +44,15 @@ def _b64_any_decode(s: str) -> bytes:
     except Exception:
         return base64.b64decode(s + pad)
 
+
 # ─────────────────────────────────────────────────────────────
 # 엔드포인트
 # ─────────────────────────────────────────────────────────────
 @router.post("/chunk")
 async def upload_presigned_chunk(
-    # ⬇⬇ 기본값 없는 파라미터(Depends 주입)는 맨 앞에 둔다 (파이썬 규칙 충족)
     crypto: CryptoDep,
-    background_tasks: BackgroundTasks,
-
-    # ⬇⬇ 기본값 있는 파라미터들 (Form)
-    # 🚨 수정: 필드 이름을 'file'로 유지하되, 타입은 str = Form(...)으로 변경하여 Base64 문자열을 받음.
-    file: str = Form(..., description="Base64 인코딩된 청크 문자열 (클라이언트 필드명 'file'과 일치)"),
-    
+    # file은 Base64 문자열로 받음
+    file: str = Form(..., description="Base64 인코딩된 청크 문자열"),
     chunkIndex: int = Form(..., ge=1, description="현재 청크 번호 (1부터 시작)"),
     totalParts: int = Form(..., ge=1, description="전체 청크 개수"),
     presignedToken: str = Form(..., description="AES-GCM 복호화 가능한 토큰"),
@@ -82,7 +65,7 @@ async def upload_presigned_chunk(
     token_file_name: str | None = None
     
     try:
-        # 0) 유효성 검사 추가 (chunkIndex와 totalParts는 FastAPI/Pydantic이 이미 검사함)
+        # 0) 유효성 검사 추가 (FastAPI가 처리하지 못하는 비즈니스 로직)
         if chunkIndex > totalParts:
             raise HTTPException(status_code=400, detail="chunkIndex cannot be greater than totalParts.")
 
@@ -92,74 +75,79 @@ async def upload_presigned_chunk(
             job_id = token_data.jobId
             token_file_name = token_data.fileName
         except ValueError as e:
-            logger.error(f"Token validation failed (ValueError): {e}")
-            raise HTTPException(status_code=401, detail=f"Invalid or expired token: {str(e)}")
+            logger.error(f"Token validation failed (ValueError) / ERR-A: {e}")
+            # [오류 코드 적용] ERR-A: 토큰 복호화 실패/만료/변조 시 401
+            raise HTTPException(status_code=401, detail=f"ERR-A: Invalid or expired access token: {str(e)}")
 
         # 2) fileName 일치 검증
         if fileName != token_file_name:
             logger.error(
-                f"Filename mismatch for Job {job_id}: Token expects '{token_file_name}', received '{fileName}'"
+                f"Filename mismatch for Job {job_id} / ERR-B: Token expects '{token_file_name}', received '{fileName}'"
             )
+            # [오류 코드 적용] ERR-B: 파일명 불일치 시 400
             raise HTTPException(
                 status_code=400,
-                detail=f"Filename mismatch: Token expects '{token_file_name}', received '{fileName}'",
+                detail=f"ERR-B: Upload file name mismatch with token (Expected: '{token_file_name}', Received: '{fileName}')",
             )
 
         # 3) Base64 데이터 디코딩
-        base64_str = file # 🚨 수정: 'file' 변수는 이제 Base64 문자열을 담고 있음
+        base64_str = file 
         try:
             if not base64_str.strip():
-                raise ValueError("empty base64 payload")
-                
-            # 유틸리티 함수를 사용하여 디코딩
+                raise ValueError("Empty base64 payload")
+            
             chunk_binary_data = _b64_any_decode(base64_str)
         except Exception as e:
-            logger.error(f"Base64 decoding failed for chunk {chunkIndex} (Job {job_id}): {e}")
-            raise HTTPException(status_code=400, detail="Invalid Base64 data received in chunk.")
+            logger.error(f"Base64 decoding failed for chunk {chunkIndex} (Job {job_id}) / ERR-C: {e}")
+            # [오류 코드 적용] ERR-C: Base64 디코딩 실패 또는 페이로드 비어있음 시 493
+            raise HTTPException(status_code=493, detail="ERR-C: Invalid or empty Base64 chunk payload.")
 
         if not chunk_binary_data:
-            logger.error(f"Decoded chunk is empty for chunk {chunkIndex} (Job {job_id})")
-            raise HTTPException(status_code=400, detail="Decoded chunk is empty.")
+            logger.error(f"Decoded chunk is empty for chunk {chunkIndex} (Job {job_id}) / ERR-C")
+            # [오류 코드 적용] ERR-C: 디코딩 후 바이너리 데이터가 비어있음 시 493
+            raise HTTPException(status_code=493, detail="ERR-C: Decoded chunk binary data is empty.")
 
-        # 4) 청크 저장 경로 설정
+        # 4) 청크 저장 경로 설정 및 저장 (file_manager의 책임)
         chunk_dir = Path(settings.TEMP_ROOT) / job_id
         chunk_dir.mkdir(parents=True, exist_ok=True)
 
         chunk_filename = f"{job_id}_{token_file_name}.{chunkIndex:04d}"
         chunk_path = chunk_dir / chunk_filename
 
-        # 5) 디코딩된 바이너리 데이터를 파일에 쓰기
         with chunk_path.open("wb") as buffer:
             buffer.write(chunk_binary_data)
 
         logger.info(
-            f"Chunk {chunkIndex}/{totalParts} saved for Job {job_id} "
-            f"(size={len(chunk_binary_data)}B, path={chunk_path})"
+            f"Chunk {chunkIndex}/{totalParts} saved for Job {job_id}"
         )
+        
+        # 5) 파일 저장 성공 후, 진행률 통보 로직을 file_manager 서비스에 위임 (Redis 통신은 이제 file_manager 내부에서 처리)
+        chunk_saved_progress(job_id, chunkIndex, totalParts)
+        
         return {"message": "Chunk uploaded successfully", "jobId": job_id, "chunkIndex": chunkIndex}
 
     except HTTPException:
-        # HTTPException은 그대로 재발생
         raise
     except Exception as e:
         logger.error(f"Unexpected Error during chunk upload: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error during upload")
+        # 처리되지 않은 모든 예외는 500
+        raise HTTPException(status_code=500, detail="Internal server error during chunk upload")
 
 @router.post("/complete")
 async def complete_presigned_upload(
-    # ⬇⬇ 기본값 없는 파라미터 먼저
     crypto: CryptoDep,
     background_tasks: BackgroundTasks,
 
-    # ⬇⬇ 기본값 있는 Form 파라미터들
     totalParts: int = Form(..., ge=1, description="전체 청크 개수"),
     presignedToken: str = Form(..., description="AES-GCM 복호화 가능한 토큰"),
 ):
     """
-    청크 완료 확인 → 병합 → AI 처리 트리거 (Placeholder 유지)
+    청크 완료 확인 (무결성 검증) → 프론트엔드에 즉시 응답 → 백그라운드에서 병합 및 AI 트리거
     """
     job_id: str | None = None
     chunk_dir: Path | None = None
+    file_name: str | None = None
+    
     try:
         # 1) 토큰 복호화/검증
         try:
@@ -167,52 +155,47 @@ async def complete_presigned_upload(
             job_id = token_data.jobId
             file_name = token_data.fileName
         except ValueError as e:
-            logger.error(f"Token validation failed in /complete: {e}")
-            raise HTTPException(status_code=401, detail=f"Invalid or expired token: {str(e)}")
+            logger.error(f"Token validation failed in /complete / ERR-A: {e}")
+            # [오류 코드 적용] ERR-A: 토큰 복호화 실패/만료/변조 시 401
+            raise HTTPException(status_code=401, detail=f"ERR-A: Invalid or expired access token: {str(e)}")
 
         # 2) 임시 청크 폴더 확인
         chunk_dir = Path(settings.TEMP_ROOT) / job_id
         if not chunk_dir.exists():
             raise HTTPException(status_code=404, detail="Job ID not found or no chunks uploaded.")
 
-        # 3) 개수 검증
+        # 3) 개수 검증 (무결성 검증)
         chunk_files = sorted(chunk_dir.glob(f"{job_id}_{file_name}.*"))
         actual_parts = len(chunk_files)
+        
         if actual_parts != totalParts:
             logger.error(
-                f"Integrity check failed for Job {job_id}: Expected {totalParts} parts, found {actual_parts}."
+                f"Integrity check failed for Job {job_id} / ERR-D: Expected {totalParts} parts, found {actual_parts}."
             )
-            shutil.rmtree(chunk_dir, ignore_errors=True)
+            # [오류 코드 적용] ERR-D: 청크 개수 불일치 시 494
             raise HTTPException(
-                status_code=400,
-                detail=f"Incomplete upload: Expected {totalParts} chunks, but only {actual_parts} were received.",
+                status_code=494,
+                detail=f"ERR-D: Incomplete upload: Expected {totalParts} chunks, but only {actual_parts} were received.",
             )
 
-        # 4) 병합 (최종 저장 루트: SAVE_ROOT)
-        final_path = Path(settings.SAVE_ROOT) / f"{job_id}_{file_name}"
-        final_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Integrity check SUCCESS for Job {job_id}. Found {actual_parts}/{totalParts} chunks.")
 
-        with final_path.open("wb") as outfile:
-            for chunk_file in chunk_files:
-                with chunk_file.open("rb") as infile:
-                    shutil.copyfileobj(infile, outfile)
+        # 4) 백그라운드 작업 추가 (병합, 정리, AI 트리거) - file_manager 서비스에 위임
+        background_tasks.add_task(
+            merge_chunks_and_cleanup, 
+            job_id, 
+            file_name, 
+            totalParts, 
+            chunk_dir
+        )
+        logger.info(f"Background merge/cleanup task added for Job {job_id}.")
 
-        logger.info(f"File merged successfully: {final_path}")
-
-        # 5) 임시 청크 폴더 정리
-        shutil.rmtree(chunk_dir, ignore_errors=True)
-
-        # 6) AI 데모 비동기 시작 (Placeholder 유지)
-        background_tasks.add_task(trigger_ai_demo, job_id, final_path)
-        logger.info("AI processing successfully initiated (via background task).")
-
-        return {"message": "Upload complete, file merged, and AI processing initiated", "jobId": job_id}
+        # 5) 클라이언트에게 즉시 성공 응답
+        return {"message": "Upload integrity verified, processing started in background.", "jobId": job_id}
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error during completion: {e}")
-        # chunk_dir이 정의되었고 존재하는 경우에만 정리 시도
-        if 'chunk_dir' in locals() and chunk_dir and chunk_dir.exists():
-             shutil.rmtree(chunk_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail="Internal server error during file merge")
+        logger.error(f"Error during completion integrity check: {e}", exc_info=True)
+        # 처리되지 않은 모든 예외는 500
+        raise HTTPException(status_code=500, detail="Internal server error during integrity check")
