@@ -46,7 +46,7 @@ app.add_middleware(
 
 # ─────────────────────────────────────────────────────────────
 # 미들웨어: 요청/응답 로깅
-#   - 큰 파일 업로드 환경이라 body 로깅은 기본 OFF
+#   - 큰 파일 업로드 환경이라 body 로깅은 기본 OFF
 # ─────────────────────────────────────────────────────────────
 class RequestLogMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -75,7 +75,7 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
 
 # ─────────────────────────────────────────────────────────────
 # 미들웨어: 업로드 용량 제한 (Content-Length 기반)
-#   - .env의 MAX_UPLOAD_BYTES 초과 시 413 반환
+#   - .env의 MAX_UPLOAD_BYTES 초과 시 413 반환
 # ─────────────────────────────────────────────────────────────
 class UploadLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -156,9 +156,9 @@ def _check_static_mount() -> dict:
 
 # ─────────────────────────────────────────────────────────────
 # 정적 파일 서빙 마운트
-#   - STATIC_BASE_URL의 path를 FastAPI에 매핑
-#   - 예: STATIC_BASE_URL = "http://tkv0011.ddns.net:8000/static/highlights"
-#     -> path "/static/highlights" 를 SAVE_ROOT에 연결
+#   - STATIC_BASE_URL의 path를 FastAPI에 매핑
+#   - 예: STATIC_BASE_URL = "http://tkv0011.ddns.net:8000/static/highlights"
+#     -> path "/static/highlights" 를 SAVE_ROOT에 연결
 # ─────────────────────────────────────────────────────────────
 parsed = urlparse(settings.STATIC_BASE_URL)
 static_path = parsed.path or "/static/highlights"
@@ -222,7 +222,23 @@ def debug_selfcheck():
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     logger.warning(f"Validation error {request.url.path}: {exc.errors()}")
-    return JSONResponse(status_code=422, content={"error": "validation_error", "detail": exc.errors()})
+    
+    # 🚨 수정된 부분: Pydantic Validation Errors를 JSON 직렬화 가능하도록 정리
+    # exc.errors()는 비직렬화 가능한 객체를 포함할 수 있으므로, 
+    # JSONResponse를 생성하기 전에 모든 내용을 문자열로 강제 변환합니다.
+    errors_list = []
+    for error in exc.errors():
+        # location, msg, type 필드는 일반적으로 직렬화 가능하지만, 
+        # 혹시 모를 내부 객체를 대비하여 전체를 딕셔너리로 다시 구성
+        errors_list.append({
+            "loc": [str(loc) for loc in error.get("loc", [])],
+            "msg": str(error.get("msg", "Validation failed")),
+            "type": str(error.get("type", "unknown_type")),
+            # raw_error가 있을 경우 문자열로 변환 (ValueError가 여기 들어갈 수 있음)
+            "input": str(error.get("input")),
+        })
+    
+    return JSONResponse(status_code=422, content={"error": "validation_error", "detail": errors_list})
 
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
