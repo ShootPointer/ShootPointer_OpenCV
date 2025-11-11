@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, Form, HTTPException, BackgroundTasks
 
 from app.core.config import settings
 from app.core.crypto import AESGCMCrypto, DecryptedToken, get_crypto_service
-from app.services.file_manager import merge_chunks_and_cleanup, chunk_saved_progress # 파일 I/O 및 진행률 알림 위임
+from app.services.file_manager import merge_chunks_and_cleanup # 파일 I/O 및 진행률 알림 위임 (chunk_saved_progress 제거됨)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -121,8 +121,8 @@ async def upload_presigned_chunk(
             f"Chunk {chunkIndex}/{totalParts} saved for Job {job_id}"
         )
         
-        # 5) 파일 저장 성공 후, 진행률 통보 로직을 file_manager 서비스에 위임 (Redis 통신은 이제 file_manager 내부에서 처리)
-        chunk_saved_progress(job_id, chunkIndex, totalParts)
+        # 5) 파일 저장 성공 후, 진행률 통보 로직 제거 (병합 시에만 보고하도록 변경됨)
+        # chunk_saved_progress(job_id, chunkIndex, totalParts) # <--- 이 라인이 제거되었습니다.
         
         return {"message": "Chunk uploaded successfully", "jobId": job_id, "chunkIndex": chunkIndex}
 

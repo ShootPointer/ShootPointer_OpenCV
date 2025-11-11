@@ -51,10 +51,10 @@ class Settings(BaseModel):
     AUTO_TOPK: int = int(os.getenv("AUTO_TOPK", "5"))
 
     # ── 등번호 감지 파라미터(OpenCV + Tesseract) ─────────────
-    JERSEY_SAMPLE_FPS: float = float(os.getenv("JERSEY_SAMPLE_FPS", "1.5"))  # 초당 샘플 프레임
+    JERSEY_SAMPLE_FPS: float = float(os.getenv("JERSEY_SAMPLE_FPS", "1.5"))   # 초당 샘플 프레임
     JERSEY_MIN_SEG_DUR: float = float(os.getenv("JERSEY_MIN_SEG_DUR", "1.2")) # 최소 구간 길이(초)
-    JERSEY_MERGE_GAP: float = float(os.getenv("JERSEY_MERGE_GAP", "2.0"))    # 인접 구간 병합 간격(초)
-    JERSEY_NUM_CONF: float = float(os.getenv("JERSEY_NUM_CONF", "0.5"))      # 숫자 신뢰도 하한(0~1)
+    JERSEY_MERGE_GAP: float = float(os.getenv("JERSEY_MERGE_GAP", "2.0"))     # 인접 구간 병합 간격(초)
+    JERSEY_NUM_CONF: float = float(os.getenv("JERSEY_NUM_CONF", "0.5"))       # 숫자 신뢰도 하한(0~1)
 
     # ── OCR / Tesseract ───────────────────────────────────────
     # 단일 PSM(레거시 호환). 예: "7" (한 줄)
@@ -76,8 +76,8 @@ class Settings(BaseModel):
     OCR_MAX_SEC: float = float(os.getenv("OCR_MAX_SEC", "8.0"))
 
     # ── 실행/로깅/안정화 ─────────────────────────────────────
-    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")                            # DEBUG/INFO/WARNING/ERROR
-    REQUEST_LOG_BODY: bool = _getenv_bool("REQUEST_LOG_BODY", False)        # 대용량 업로드 대비 False 권장
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")                       # DEBUG/INFO/WARNING/ERROR
+    REQUEST_LOG_BODY: bool = _getenv_bool("REQUEST_LOG_BODY", False)       # 대용량 업로드 대비 False 권장
     # 서브프로세스(FFmpeg 등) 타임아웃(초)
     FFMPEG_TIMEOUT_SEC: int = int(os.getenv("FFMPEG_TIMEOUT_SEC", "120"))
     # 업로드 최대 크기(바이트). 0 또는 미설정이면 제한 없음 (기본 200MB)
@@ -106,48 +106,66 @@ class Settings(BaseModel):
     ALLOW_ORIGINS: str = os.getenv("ALLOW_ORIGINS", "*")
 
     # ── 백엔드 콜백/전달(저장 없이 즉시 업로드) ───────────────
-    BACKEND_SECRET: str = os.getenv("BACKEND_SECRET", "")  # 백엔드-서버 공유 시크릿(없으면 검증 생략)
+    BACKEND_SECRET: str = os.getenv("BACKEND_SECRET", "")   # 백엔드-서버 공유 시크릿(없으면 검증 생략)
     CALLBACK_CONNECT_TIMEOUT: float = float(os.getenv("CALLBACK_CONNECT_TIMEOUT", "30"))
     CALLBACK_READ_TIMEOUT: float = float(os.getenv("CALLBACK_READ_TIMEOUT", "60"))
     CALLBACK_WRITE_TIMEOUT: float = float(os.getenv("CALLBACK_WRITE_TIMEOUT", "60"))
     
-    # ⬇⬇⬇ 청크 업로드 및 암호화/복호화에 필요한 키 (수정됨) ⬇⬇⬇
-    # crypto.py에서 사용할 AES-GCM 복호화 키 (PRE_SIGNED_SECRET이 아니라 AES_GCM_SECRET을 환경변수에서 읽습니다.)
+    # ⬇⬇⬇ 청크 업로드 및 암호화/복호화에 필요한 키 ⬇⬇⬇
+    # crypto.py에서 사용할 AES-GCM 복호화 키
     AES_GCM_SECRET: str = os.getenv("AES_GCM_SECRET", "") 
     # 기존 PRE_SIGNED_SECRET 변수는 그대로 유지 (다른 곳에서 사용될 수 있으므로)
     PRE_SIGNED_SECRET: str = os.getenv("PRE_SIGNED_SECRET", "")
-    # ⬆⬆⬆ 청크 업로드 및 암호화/복호화에 필요한 키 (수정됨) ⬆⬆⬆
+    # ⬆⬆⬆ 청크 업로드 및 암호화/복호화에 필요한 키 ⬆⬆⬆
 
     PRESIGNED_EXPIRES_MIN: int = int(os.getenv("PRESIGNED_EXPIRES_MIN", "30") or "30")
     UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "/tmp/uploads")
     UPLOAD_CHUNK_MAX_MB: int = int(os.getenv("UPLOAD_CHUNK_MAX_MB", "0") or "0")
     # ↓ 추가 (TEMP_ROOT가 없어서 크래시 나니, UPLOAD_DIR을 기본으로 물려주기)
     TEMP_ROOT: str = os.getenv("TEMP_ROOT", UPLOAD_DIR)
-    # 기본 Plan registry 모듈 경로. 환경변수로 절대/상대 .py 파일 경로를 지정하면
-    # services.plan_registry 가 자동으로 처리한다.
+
+    # ── FastAPI 업로드/Redis 연동 (FastAPI 필수 변수 추가) ────────
+    # FastAPI가 청크를 임시 저장할 폴더 (TEMP_ROOT 아래의 'chunks' 폴더)
+    CHUNK_STORAGE_ROOT: str = os.getenv("CHUNK_STORAGE_ROOT", os.path.join(TEMP_ROOT, "chunks"))
+    # FastAPI가 Spring 서버에 보고할 때 사용할 사용자 ID (임시)
+    MEMBER_ID: str = os.getenv("MEMBER_ID", "default_user_id") 
+    # FastAPI 컨테이너 외부에서 최종 병합 파일에 접근할 수 있는 기본 URL
+    EXTERNAL_BASE_URL: str = os.getenv("EXTERNAL_BASE_URL", "http://fastapi-host:8000/files")
+    # ─────────────────────────────────────────────────────────────
+
+    # 기본 Plan registry 모듈 경로.
     PLAN_REGISTRY_PY: str = os.getenv("PLAN_REGISTRY_PY", "app.data.registry")
 
     # ─────────────────────────────────────────────────────────
-    # ⬇⬇⬇ 이번 단계에 필요한 추가 설정(보강) ⬇⬇⬇
+    # ⬇⬇⬇ Redis 및 파일 저장 경로 설정 ⬇⬇⬇
     # ─────────────────────────────────────────────────────────
+    # [1. REDIS_URL 설정]: 홈 서버의 Redis에 접속하기 위해 127.0.0.1 (호스트) 사용
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0") 
+    
+    # [2. AI Worker 전용 큐 (List) 이름]: FastAPI -> AI Worker 명령 전달용 (List 자료구조)
+    REDIS_AI_JOB_QUEUE: str = os.getenv("REDIS_AI_JOB_QUEUE", "opencv-ai-job-queue")
+    
+    # [3. 채널 이름 재정의 및 정리] (Pub/Sub 채널)
+    # Spring 서버로 업로드 진행률을 보낼 채널 
+    REDIS_UPLOAD_PROGRESS_CHANNEL: str = os.getenv(
+        "REDIS_UPLOAD_PROGRESS_CHANNEL", "opencv-progress-upload"
+    )
+    # Spring 서버로 하이라이트 진행률을 보낼 채널 
+    REDIS_HIGHLIGHT_PROGRESS_CHANNEL: str = os.getenv(
+        "REDIS_HIGHLIGHT_PROGRESS_CHANNEL", "opencv-progress-highlight"
+    )
+
+    PROGRESS_PUBLISH_INTERVAL_SEC: float = float(os.getenv("PROGRESS_PUBLISH_INTERVAL_SEC", "5") or "5")
+    PROGRESS_INTERVAL_SEC: float = float(os.getenv("PROGRESS_INTERVAL_SEC", "5") or "5")
+
     # 파일 저장 루트 (컨테이너 내부 경로) - job_id 폴더가 이 아래에 생성됩니다.
     SAVE_ROOT: str = os.getenv("SAVE_ROOT", "/data/highlights")
     # 외부에서 접근할 정적 URL 베이스 - 예: https://your-domain/static/highlights
     STATIC_BASE_URL: str = os.getenv("STATIC_BASE_URL", "https://your-domain/static/highlights")
-    # Redis 연결 URL - 예: redis://redis:6379/0
-    REDIS_URL: str = os.getenv("REDIS_URL", "redis://redis:6379/0")
-    REDIS_UPLOAD_CHANNEL: str = os.getenv("REDIS_UPLOAD_CHANNEL", "upload_progress")
-    REDIS_PROCESS_CHANNEL: str = os.getenv("REDIS_PROCESS_CHANNEL", "process_progress")
-        # 신규 진행률 채널명 (요구사항: opencv-progress-*)
-    REDIS_UPLOAD_PROGRESS_CHANNEL: str = os.getenv(
-        "REDIS_UPLOAD_PROGRESS_CHANNEL", "opencv-progress-upload"
-    )
-    REDIS_HIGHLIGHT_PROGRESS_CHANNEL: str = os.getenv(
-        "REDIS_HIGHLIGHT_PROGRESS_CHANNEL", "opencv-progress-highlight"
-    )
-    PROGRESS_PUBLISH_INTERVAL_SEC: float = float(os.getenv("PROGRESS_PUBLISH_INTERVAL_SEC", "5") or "5")
-    PROGRESS_INTERVAL_SEC: float = float(os.getenv("PROGRESS_INTERVAL_SEC", "5") or "5")
-
+    # ─────────────────────────────────────────────────────────
+    # ⬆⬆⬆ Redis 및 파일 저장 경로 설정 ⬆⬆⬆
+    # ─────────────────────────────────────────────────────────
+    
     # 결과를 Redis Key/Value로 저장할지 여부 (백엔드가 GET으로 즉시 조회 가능)
     PUBLISH_RESULT_AS_KV: bool = _getenv_bool("PUBLISH_RESULT_AS_KV", True)
     # 결과 Key 프리픽스: highlight-{jobId}
@@ -181,7 +199,7 @@ class Settings(BaseModel):
     BALL_HSV_MIN: str = os.getenv("BALL_HSV_MIN", "5,60,60")
     BALL_HSV_MAX: str = os.getenv("BALL_HSV_MAX", "25,255,255")
     # HoughLinesP 파라미터(코트 라인)
-    HOUGH_MIN_LINE_RATIO: float = float(os.getenv("HOUGH_MIN_LINE_RATIO", "0.25"))  # minLineLength = ratio * width
+    HOUGH_MIN_LINE_RATIO: float = float(os.getenv("HOUGH_MIN_LINE_RATIO", "0.25"))   # minLineLength = ratio * width
     HOUGH_MAX_GAP: int = int(os.getenv("HOUGH_MAX_GAP", "20"))
     HOUGH_THRESH: int = int(os.getenv("HOUGH_THRESH", "120"))
     # Homography(RANSAC) 허용 오차

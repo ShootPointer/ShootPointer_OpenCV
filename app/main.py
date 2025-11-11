@@ -1,3 +1,4 @@
+# app/main.py
 from __future__ import annotations
 
 import logging
@@ -6,6 +7,7 @@ import os
 import shutil
 import subprocess
 from urllib.parse import urlparse
+from typing import Any, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -15,11 +17,12 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
+# --- Redis imports (기능 유지) ---
+from app.core.redis_client import init_redis, close_redis, get_redis_client
+
 from app.core.config import settings
 from app.core.logging import setup_logging
-# ⬇️ 수정: upload를 제거하고 모든 라우터를 한 줄로 정리
 from app.routers import highlight, player, frames, presigned_upload, process, ai_demo
-# ⬆️ 수정
 
 # ─────────────────────────────────────────────────────────────
 # 로깅 초기화
@@ -27,10 +30,12 @@ from app.routers import highlight, player, frames, presigned_upload, process, ai
 setup_logging(settings.LOG_LEVEL)
 logger = logging.getLogger("app")
 
+
 # ─────────────────────────────────────────────────────────────
 # FastAPI 앱
 # ─────────────────────────────────────────────────────────────
 app = FastAPI(title="Basket Highlight AI", version="0.6.0")
+
 
 # ─────────────────────────────────────────────────────────────
 # CORS (settings.ALLOW_ORIGINS 사용)
@@ -44,9 +49,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ─────────────────────────────────────────────────────────────
-# 미들웨어: 요청/응답 로깅
-#   - 큰 파일 업로드 환경이라 body 로깅은 기본 OFF
+# 미들웨어: 요청/응답 로깅 (대용량 업로드라 body 로깅 기본 OFF)
 # ─────────────────────────────────────────────────────────────
 class RequestLogMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -73,9 +78,10 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
                 content={"error": "internal_server_error", "detail": str(e)},
             )
 
+
 # ─────────────────────────────────────────────────────────────
 # 미들웨어: 업로드 용량 제한 (Content-Length 기반)
-#   - .env의 MAX_UPLOAD_BYTES 초과 시 413 반환
+#  - .env의 MAX_UPLOAD_BYTES 초과 시 413 반환
 # ─────────────────────────────────────────────────────────────
 class UploadLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -84,32 +90,40 @@ class UploadLimitMiddleware(BaseHTTPMiddleware):
                 cl = request.headers.get("content-length")
                 if cl and cl.isdigit():
                     if int(cl) > settings.MAX_UPLOAD_BYTES:
-                        logger.warning(f"413 payload too large: {cl} bytes > limit {settings.MAX_UPLOAD_BYTES}")
+                        logger.warning(
+                            f"413 payload too large: {cl} bytes > limit {settings.MAX_UPLOAD_BYTES}"
+                        )
                         return JSONResponse(
                             status_code=413,
                             content={"error": "payload_too_large", "detail": "upload exceeds MAX_UPLOAD_BYTES"},
                         )
         except Exception as e:
-            # 제한 체크 실패 시 통과(로그만)
+            # 제한 체크 실패 시 통과(로그만 남김)
             logger.warning(f"Upload limit check failed: {e}")
 
         return await call_next(request)
 
+
 app.add_middleware(RequestLogMiddleware)
 app.add_middleware(UploadLimitMiddleware)
 
+
 # ─────────────────────────────────────────────────────────────
-# 유틸: 실행파일 버전 확인/존재 확인
+# 유틸: 실행파일 버전/존재 확인
 # ─────────────────────────────────────────────────────────────
-def _which(cmd: str) -> str | None:
+def _which(cmd: str) -> Optional[str]:
     return shutil.which(cmd)
+
 
 def _run_out(args: list[str]) -> tuple[bool, str]:
     try:
-        out = subprocess.check_output(args, stderr=subprocess.STDOUT, timeout=5).decode("utf-8", errors="ignore").strip()
+        out = subprocess.check_output(args, stderr=subprocess.STDOUT, timeout=5).decode(
+            "utf-8", errors="ignore"
+        ).strip()
         return True, out
     except Exception as e:
         return False, str(e)
+
 
 def _check_ff_binaries() -> dict:
     ok_ffmpeg = _which("ffmpeg") is not None
@@ -123,10 +137,12 @@ def _check_ff_binaries() -> dict:
         "ffprobe_version": ffprobe_ver.splitlines()[0] if isinstance(ffprobe_ver, str) else ffprobe_ver,
     }
 
+
 def _check_font() -> dict:
     font = os.getenv("DRAW_FONTFILE") or "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
     exists = os.path.exists(font)
     return {"font_path": font, "exists": exists}
+
 
 def _check_save_root() -> dict:
     root = settings.SAVE_ROOT
@@ -147,18 +163,17 @@ def _check_save_root() -> dict:
         msg = f"not a directory: {root}"
     return {"save_root": root, "dir_ok": ok_path, "writable": ok_write, "detail": msg}
 
+
 def _check_static_mount() -> dict:
     parsed = urlparse(settings.STATIC_BASE_URL)
     return {
         "STATIC_BASE_URL": settings.STATIC_BASE_URL,
-        "mount_path": parsed.path or "/static/highlights"
+        "mount_path": parsed.path or "/static/highlights",
     }
+
 
 # ─────────────────────────────────────────────────────────────
 # 정적 파일 서빙 마운트
-#   - STATIC_BASE_URL의 path를 FastAPI에 매핑
-#   - 예: STATIC_BASE_URL = "http://tkv0011.ddns.net:8000/static/highlights"
-#     -> path "/static/highlights" 를 SAVE_ROOT에 연결
 # ─────────────────────────────────────────────────────────────
 parsed = urlparse(settings.STATIC_BASE_URL)
 static_path = parsed.path or "/static/highlights"
@@ -169,11 +184,22 @@ app.mount(
     name="static-highlights",
 )
 
+
 # ─────────────────────────────────────────────────────────────
-# 스타트업 셀프체크: 환경 차이로 인한 실패 예방
+# 스타트업: 셀프체크 및 Redis 연결 초기화
 # ─────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def _startup_selfcheck():
+    # Redis 연결
+    logger.info("[startup] Initializing Redis connection...")
+    try:
+        await init_redis()
+        logger.info("[startup] Redis connection established successfully.")
+    except Exception as e:
+        # Redis 실패해도 서버 기동은 하되 로그 남김
+        logger.error(f"[startup] FATAL ERROR: Failed to connect to Redis. Functionality limited. Error: {e}")
+
+    # 환경 요약 로그
     env_summary = {
         "LOG_LEVEL": settings.LOG_LEVEL,
         "SAVE_ROOT": settings.SAVE_ROOT,
@@ -197,7 +223,20 @@ async def _startup_selfcheck():
     else:
         logger.info(f"[startup] SAVE_ROOT OK: {sr}")
 
-# (선택) 수동 점검용 엔드포인트
+
+# ─────────────────────────────────────────────────────────────
+# 셧다운: Redis 연결 종료
+# ─────────────────────────────────────────────────────────────
+@app.on_event("shutdown")
+async def _shutdown_cleanup():
+    logger.info("[shutdown] Closing Redis connection...")
+    await close_redis()
+    logger.info("[shutdown] Redis connection closed.")
+
+
+# ─────────────────────────────────────────────────────────────
+# 디버그 셀프체크
+# ─────────────────────────────────────────────────────────────
 @app.get("/debug/selfcheck")
 def debug_selfcheck():
     return {
@@ -216,51 +255,58 @@ def debug_selfcheck():
         "status": "ok",
     }
 
+
 # ─────────────────────────────────────────────────────────────
 # 전역 예외 핸들러
 # ─────────────────────────────────────────────────────────────
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     logger.warning(f"Validation error {request.url.path}: {exc.errors()}")
-    
-    # 🚨 수정된 부분: Pydantic Validation Errors를 JSON 직렬화 가능하도록 정리
-    # exc.errors()는 비직렬화 가능한 객체를 포함할 수 있으므로, 
-    # JSONResponse를 생성하기 전에 모든 내용을 문자열로 강제 변환합니다.
-    errors_list = []
+
+    # Pydantic Validation Errors를 JSON 직렬화 가능하게 정리
+    errors_list: list[dict[str, Any]] = []
     for error in exc.errors():
-        # location, msg, type 필드는 일반적으로 직렬화 가능하지만, 
-        # 혹시 모를 내부 객체를 대비하여 전체를 딕셔너리로 다시 구성
         errors_list.append({
             "loc": [str(loc) for loc in error.get("loc", [])],
             "msg": str(error.get("msg", "Validation failed")),
             "type": str(error.get("type", "unknown_type")),
-            # raw_error가 있을 경우 문자열로 변환 (ValueError가 여기 들어갈 수 있음)
             "input": str(error.get("input")),
         })
-    
+
     return JSONResponse(status_code=422, content={"error": "validation_error", "detail": errors_list})
+
 
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     logger.warning(f"HTTP error {request.url.path}: {exc.detail}")
     return JSONResponse(status_code=exc.status_code, content={"error": "http_error", "detail": exc.detail})
 
+
 # ─────────────────────────────────────────────────────────────
-# 헬스체크
+# 헬스체크 (Redis 상태 포함)
 # ─────────────────────────────────────────────────────────────
 @app.get("/health")
-def health():
-    return {"status": "ok"}
+async def health():
+    redis_status = "ERROR - Redis client not initialized"
+    try:
+        redis_client = get_redis_client()
+        if redis_client:
+            await redis_client.ping()  # redis.asyncio 사용 가정
+            redis_status = "OK"
+        else:
+            redis_status = "ERROR - Redis client not initialized"
+    except Exception as e:
+        redis_status = f"ERROR - Redis unreachable ({e})"
+
+    return {"status": "ok", "redis_connection": redis_status}
+
 
 # ─────────────────────────────────────────────────────────────
 # 라우터 등록
 # ─────────────────────────────────────────────────────────────
-# app.include_router(upload.router) # ⬅️ 제거됨
 app.include_router(highlight.router)
 app.include_router(player.router)
 app.include_router(frames.router)
 app.include_router(presigned_upload.router)
 app.include_router(process.router)
-
-# ✅ 데모 하이라이트(자동식별 → 지정 구간 컷 → 메타데이터/집계) 라우터 등록
 app.include_router(ai_demo.router, prefix="")

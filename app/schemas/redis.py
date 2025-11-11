@@ -12,10 +12,10 @@ class UploadStatus(str, Enum):
     UPLOADING = "UPLOADING"
     # 청크가 모두 모여 병합/처리 대기 중 (Complete 엔드포인트 응답 후)
     PROCESSING = "PROCESSING"
-    # 원본 파일 저장 및 정리 완료 (Background Task 완료 시 1회 발행)
-    UPLOAD_COMPLETE = "UPLOAD_COMPLETE"
+    # 원본 파일 저장 및 정리 완료 (Redis JSON 보고로 대체됨)
+    UPLOAD_COMPLETE = "UPLOAD_COMPLETE" 
     # AI 작업 시작 대기 중 (AI Queue에 넣었음을 알림)
-    AI_START_PENDING = "AI_START_PENDING"
+    AI_START_PENDING = "AI_START_PENDING" 
     # 오류 발생
     ERROR = "ERROR"
 
@@ -43,3 +43,13 @@ class ProgressMessage(BaseModel):
     current: int = Field(default=0, description="현재 진행도 카운트")
     total: int = Field(default=1, description="전체 진행도 카운트")
     resultUrl: str = Field(default="", description="최종 결과 파일 접근 URL (완료 시)")
+
+
+class AITaskPayload(BaseModel):
+    """
+    AI Worker Queue (Redis List)에 푸시될 작업 요청 페이로드
+    """
+    jobId: str = Field(..., description="작업 고유 ID")
+    memberId: str = Field(..., description="요청 사용자 ID")
+    originalFilePath: str = Field(..., description="AI Worker가 접근해야 하는 원본 파일의 임시 저장 경로/URL")
+    # TODO: AI 작업의 종류, 파라미터 등 필요한 메타데이터 추가
