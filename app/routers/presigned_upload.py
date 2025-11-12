@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, Form, HTTPException, BackgroundTasks
 
 from app.core.config import settings
 from app.core.crypto import AESGCMCrypto, DecryptedToken, get_crypto_service
-from app.services.file_manager import merge_chunks_and_cleanup # 파일 I/O 및 진행률 알림 위임 (chunk_saved_progress 제거됨)
+from app.services.file_manager import merge_chunks_and_cleanup  # 파일 I/O 및 진행률 알림 위임 (chunk_saved_progress 제거됨)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -34,15 +34,38 @@ def _b64_any_decode(s: str) -> bytes:
     # data URL prefix 제거 대응
     if "," in s and s.lstrip().lower().startswith("data:"):
         s = s.split(",", 1)[1].strip()
-    
+
     # Base64 패딩 보정 (4의 배수)
     pad = "=" * ((4 - (len(s) % 4)) % 4)
-    
+
     # URL-safe 먼저 시도 후, 실패 시 표준 Base64 시도
     try:
         return base64.urlsafe_b64decode(s + pad)
     except Exception:
         return base64.b64decode(s + pad)
+
+
+# ─────────────────────────────────────────────────────────────
+# 내부 래퍼: file_manager 시그니처(4/5인자) 모두 호환
+# ─────────────────────────────────────────────────────────────
+async def _merge_task_wrapper(
+    job_id: str,
+    file_name: str,
+    total_parts: int,
+    chunk_dir: Path,
+    member_id: str,
+):
+    """
+    file_manager.merge_chunks_and_cleanup 이
+    - (job_id, file_name, total_parts, chunk_dir, member_id) 5인자를 받으면 그대로 호출
+    - 아니라면 4인자 시그니처로 폴백
+    """
+    try:
+        # 먼저 5인자 시도 (향후 파일매니저가 member_id를 지원할 때)
+        return await merge_chunks_and_cleanup(job_id, file_name, total_parts, chunk_dir, member_id)  # type: ignore
+    except TypeError:
+        # 기존 4인자 시그니처와의 호환 유지
+        return await merge_chunks_and_cleanup(job_id, file_name, total_parts, chunk_dir)  # type: ignore
 
 
 # ─────────────────────────────────────────────────────────────
@@ -63,7 +86,7 @@ async def upload_presigned_chunk(
     """
     job_id: str | None = None
     token_file_name: str | None = None
-    
+
     try:
         # 0) 유효성 검사 추가 (FastAPI가 처리하지 못하는 비즈니스 로직)
         if chunkIndex > totalParts:
@@ -91,11 +114,11 @@ async def upload_presigned_chunk(
             )
 
         # 3) Base64 데이터 디코딩
-        base64_str = file 
+        base64_str = file
         try:
             if not base64_str.strip():
                 raise ValueError("Empty base64 payload")
-            
+
             chunk_binary_data = _b64_any_decode(base64_str)
         except Exception as e:
             logger.error(f"Base64 decoding failed for chunk {chunkIndex} (Job {job_id}) / ERR-C: {e}")
@@ -117,13 +140,11 @@ async def upload_presigned_chunk(
         with chunk_path.open("wb") as buffer:
             buffer.write(chunk_binary_data)
 
-        logger.info(
-            f"Chunk {chunkIndex}/{totalParts} saved for Job {job_id}"
-        )
-        
+        logger.info(f"Chunk {chunkIndex}/{totalParts} saved for Job {job_id}")
+
         # 5) 파일 저장 성공 후, 진행률 통보 로직 제거 (병합 시에만 보고하도록 변경됨)
         # chunk_saved_progress(job_id, chunkIndex, totalParts) # <--- 이 라인이 제거되었습니다.
-        
+
         return {"message": "Chunk uploaded successfully", "jobId": job_id, "chunkIndex": chunkIndex}
 
     except HTTPException:
@@ -133,11 +154,11 @@ async def upload_presigned_chunk(
         # 처리되지 않은 모든 예외는 500
         raise HTTPException(status_code=500, detail="Internal server error during chunk upload")
 
+
 @router.post("/complete")
 async def complete_presigned_upload(
     crypto: CryptoDep,
     background_tasks: BackgroundTasks,
-
     totalParts: int = Form(..., ge=1, description="전체 청크 개수"),
     presignedToken: str = Form(..., description="AES-GCM 복호화 가능한 토큰"),
 ):
@@ -147,13 +168,15 @@ async def complete_presigned_upload(
     job_id: str | None = None
     chunk_dir: Path | None = None
     file_name: str | None = None
-    
+    member_id: str | None = None
+
     try:
         # 1) 토큰 복호화/검증
         try:
             token_data: DecryptedToken = crypto.decrypt_token(presignedToken)
             job_id = token_data.jobId
             file_name = token_data.fileName
+            member_id = token_data.memberId  # ← A-1: memberId 추출
         except ValueError as e:
             logger.error(f"Token validation failed in /complete / ERR-A: {e}")
             # [오류 코드 적용] ERR-A: 토큰 복호화 실패/만료/변조 시 401
@@ -167,7 +190,7 @@ async def complete_presigned_upload(
         # 3) 개수 검증 (무결성 검증)
         chunk_files = sorted(chunk_dir.glob(f"{job_id}_{file_name}.*"))
         actual_parts = len(chunk_files)
-        
+
         if actual_parts != totalParts:
             logger.error(
                 f"Integrity check failed for Job {job_id} / ERR-D: Expected {totalParts} parts, found {actual_parts}."
@@ -180,15 +203,17 @@ async def complete_presigned_upload(
 
         logger.info(f"Integrity check SUCCESS for Job {job_id}. Found {actual_parts}/{totalParts} chunks.")
 
-        # 4) 백그라운드 작업 추가 (병합, 정리, AI 트리거) - file_manager 서비스에 위임
+        # 4) 백그라운드 작업 추가 (병합, 정리, AI 트리거)
+        #    - A-1: memberId를 래퍼에 함께 전달 (file_manager가 4인자여도 안전)
         background_tasks.add_task(
-            merge_chunks_and_cleanup, 
-            job_id, 
-            file_name, 
-            totalParts, 
-            chunk_dir
+            _merge_task_wrapper,
+            job_id,
+            file_name,
+            totalParts,
+            chunk_dir,
+            member_id or "",  # Not None 보장
         )
-        logger.info(f"Background merge/cleanup task added for Job {job_id}.")
+        logger.info(f"Background merge/cleanup task added for Job {job_id} (memberId={member_id}).")
 
         # 5) 클라이언트에게 즉시 성공 응답
         return {"message": "Upload integrity verified, processing started in background.", "jobId": job_id}

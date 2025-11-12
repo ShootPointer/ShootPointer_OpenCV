@@ -1,233 +1,195 @@
 # app/routers/process.py
 from __future__ import annotations
 
-import asyncio
 import logging
 import uuid
 from pathlib import Path
 from typing import Dict, Optional, List
 
-import httpx
-from fastapi import APIRouter, BackgroundTasks, Request
-from fastapi import Query, Body
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi import APIRouter, BackgroundTasks, Body, Query
+from fastapi.responses import JSONResponse
 
+from app.core.redis_client import get_redis_client
+from app.schemas.redis import AITaskPayload, UploadStatus, ProgressMessage
 from app.core.config import settings
-from app.services.pipeline import generate_highlight_clips
-from app.services.jersey import detect_player_segments
-from app.services.ffmpeg import get_duration
-from app.services.streaming import build_zip_spooled
-# ⛳ send-img에서 쓰던 캐시 재사용 (등번호 기억)
 from app.routers.player import JERSEY_CACHE
 
 router = APIRouter(prefix="/api", tags=["process"])
 logger = logging.getLogger(__name__)
 
-UPLOAD_DIR = Path("/tmp/presigned_uploads")
-RESULT_DIR = Path("/tmp/results")
-RESULT_DIR.mkdir(parents=True, exist_ok=True)
-
 # ─────────────────────────
-# 간단 Job 상태 메모리 저장소
+# Job 상태 메모리 저장소 (디버깅용)
 # ─────────────────────────
 class JobState:
+    """처리 Job의 상태를 임시로 저장하는 인메모리 모델"""
     def __init__(self, upload_id: str, member_id: str, highlight_key: Optional[str] = None):
         self.uploadId = upload_id
         self.memberId = member_id
         self.highlightKey = highlight_key
-        self.status: str = "queued"       # queued|running|done|error
-        self.progress: float = 0.0        # 0.0~100.0
+        self.status: str = "queued"      # queued|running|done|error
+        self.progress: float = 0.0
         self.message: str = ""
-        self.resultZip: Optional[Path] = None
-        self.videoPath: Optional[Path] = None
+        self.resultUrl: Optional[str] = None
         self.error: Optional[str] = None
         self.requestId: str = uuid.uuid4().hex[:8]
 
 JOBS: Dict[str, JobState] = {}
 
 # ─────────────────────────
-# 유틸
+# 내부: AI Worker 큐잉
 # ─────────────────────────
-def _find_uploaded(member_id: str, upload_id: str, highlight_key: Optional[str] = None) -> Optional[Path]:
-    # ✅ 새로운 저장 규칙: SAVE_ROOT/{memberId}/{highlightKey}/localDateTime/original_*.mp4
-    if highlight_key:
-        root = Path(settings.SAVE_ROOT) / member_id / highlight_key
-        if root.is_dir():
-            candidates = sorted(
-                root.glob("*/original_*.mp4"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            if candidates:
-                return candidates[0]
+async def _queue_ai_worker_job(job_payload: AITaskPayload, queue_name: str = settings.REDIS_QUEUE_NAME):
+    """비동기 Redis 클라이언트를 사용하여 AI Worker 큐(List)에 작업을 푸시"""
+    redis_async = get_redis_client()
+    message = job_payload.model_dump_json()
+    await redis_async.rpush(queue_name, message)
+    logger.info(f"[queue] PUSHED job to {queue_name}: {job_payload.jobId}")
 
-    # ⬇ 레거시 호환: presigned_upload.py가 저장한 규칙: {memberId}_{uploadId}.mp4
-    cand = UPLOAD_DIR / f"{member_id}_{upload_id}.mp4"
-    return cand if cand.exists() else None
-
-async def _safe_post_json(url: str, payload: dict, timeout: float = 10.0):
+# ─────────────────────────
+# 내부: Spring용 진행률 Pub/Sub (비동기)
+# ─────────────────────────
+async def _publish_progress_async(
+    job_id: str,
+    status: UploadStatus,
+    message: str = "",
+    current: int = 0,
+    total: int = 1,
+) -> None:
+    """간단 Pub/Sub 발행"""
     try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as cli:
-            r = await cli.post(url, json=payload)
-            return r.status_code, (r.text[:200] if r.text else "")
-    except Exception as e:
-        return -1, str(e)
-
-async def _notify(job: JobState, progress_url: Optional[str], completed_url: Optional[str]):
-    # 진행률 또는 완료 통지(둘 중 필요한 쪽으로만 호출)
-    payload = {
-        "uploadId": job.uploadId,
-        "memberId": job.memberId,
-        "status": job.status,
-        "progress": round(job.progress, 1),
-        "message": job.message,
-        "requestId": job.requestId,
-    }
-    if job.highlightKey:
-        payload["highlightKey"] = job.highlightKey
-    if job.status == "done":
-        payload["downloadUrl"] = f"/api/process/{job.uploadId}/result"  # OpenCV 서버의 다운로드 엔드포인트
-    url = completed_url if job.status == "done" and completed_url else progress_url
-    if not url:
-        return
-    code, note = await _safe_post_json(url, payload)
-    logger.info(f"[process.notify] [{job.requestId}] -> {url} ({code}) {note}")
-
-def _set_progress(job: JobState, p: float, msg: str):
-    job.progress = max(0.0, min(100.0, p))
-    job.message = msg
-    logger.info(f"[process] [{job.requestId}] {job.uploadId} {job.progress:.1f}% - {msg}")
-
-# ─────────────────────────
-# 처리 본체
-# ─────────────────────────
-async def _run_job(job: JobState, progress_url: Optional[str], completed_url: Optional[str], max_clips: int):
-    try:
-        job.status = "running"
-        _set_progress(job, 1.0, "locating-upload")
-
-        src = _find_uploaded(job.memberId, job.uploadId, job.highlightKey)
-        if not src:
-            raise FileNotFoundError("uploaded video not found")
-        job.videoPath = src
-        total = get_duration(src)
-
-        # 등번호 찾기 (send-img 캐시에 저장해둔 값)
-        if job.memberId not in JERSEY_CACHE:
-            raise RuntimeError("jersey number not found in cache (call /api/send-img first)")
-        jersey_number = JERSEY_CACHE[job.memberId]
-
-        # 세그먼트 검출
-        _set_progress(job, 20.0, "detecting-player-segments")
-        segs = detect_player_segments(src, jersey_number)
-        _set_progress(job, 40.0, f"segments={len(segs)}")
-
-        # 이벤트(후보) 만들기: segs의 중앙값들(너희 로직에 맞게 바꿔도 됨)
-        events: List[float] = []
-        for s, e in segs:
-            mid = (s + e) / 2.0
-            if 0.0 <= mid <= total:
-                events.append(mid)
-        if not events:
-            # 세그먼트가 없다면, 전체 중간 하나라도 생성(빈 결과 방지)
-            events = [max(0.2, total * 0.5)]
-
-        # 클립 생성
-        _set_progress(job, 65.0, "cutting-clips")
-        results = generate_highlight_clips(
-            src,
-            jersey_number,
-            events,
-            pre=settings.DEFAULT_PRE,
-            post=settings.DEFAULT_POST,
-            max_clips=max_clips,
+        redis_async = get_redis_client()
+        progress_msg = ProgressMessage(
+            jobId=job_id,
+            status=status,
+            message=message,
+            current=current,
+            total=total,
         )
-        clip_paths = [p for _, p in results]
-
-        # ZIP 작성
-        _set_progress(job, 85.0, "zipping")
-        spooled = build_zip_spooled(clip_paths, arc_prefix=f"#{jersey_number}_")
-        out_zip = RESULT_DIR / f"{job.memberId}_{job.uploadId}.zip"
-        with out_zip.open("wb") as f:
-            for chunk in iter(lambda: spooled.read(64 * 1024), b""):
-                if not chunk: break
-                f.write(chunk)
-        spooled.close()
-
-        job.resultZip = out_zip
-        job.status = "done"
-        _set_progress(job, 100.0, "completed")
-        await _notify(job, progress_url, completed_url)
-
-        # (선택) 원본 정리: 운영정책에 맞게 주석 해제
-        # try: src.unlink(missing_ok=True)
-        # except: pass
-
+        channel = f"{settings.REDIS_UPLOAD_PROGRESS_CHANNEL}:{job_id}"
+        await redis_async.publish(channel, progress_msg.model_dump_json())
+        logger.debug(f"[pubsub] {channel}: {status.value} ({current}/{total})")
     except Exception as e:
-        job.status = "error"
-        job.error = str(e)
-        job.message = f"error: {e}"
-        logger.exception(f"[process] [{job.requestId}] job failed: {e}")
-        await _notify(job, progress_url, completed_url)
+        logger.error(f"[pubsub] Failed to publish progress for job {job_id}: {e}")
 
 # ─────────────────────────
-# API
+# 유틸: 병합본 실제 경로 찾기
+#   - 저장 형식: SAVE_ROOT/{uploadId}/{fileName}
+#   - 업로더가 보낸 fileName을 모르므로 디렉터리 내 '영상 파일' 1개를 탐색
 # ─────────────────────────
-@router.post("/process/{uploadId}", summary="Start processing an uploaded video")
+_VIDEO_EXTS: List[str] = [".mp4", ".mkv", ".mov", ".m4v"]
+
+def _find_merged_original(upload_id: str) -> Optional[Path]:
+    base = Path(settings.SAVE_ROOT) / upload_id
+    if not base.exists():
+        return None
+    # 가장 최근 파일 우선
+    candidates = sorted(
+        [p for p in base.iterdir() if p.is_file() and p.suffix.lower() in _VIDEO_EXTS],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+# ─────────────────────────
+# API: Job 시작 (큐잉 + Pub/Sub 알림)
+# ─────────────────────────
+@router.post("/process/{uploadId}", summary="Start processing (Queue Job for AI Worker)")
 async def start_process(
-    request: Request,
-    background: BackgroundTasks,
     uploadId: str,
-    memberId: str = Query(..., description="멤버 식별자"),
+    background: BackgroundTasks,
+    memberId: str = Query(..., description="멤버 식별자 (X-Member-Id와 동일한 의미)"),
     highlightKey: Optional[str] = Query(
         None,
-        description="선택: Presigned 업로드에서 사용한 highlightKey (SAVE_ROOT 탐색용)",
+        description="원본-하이라이트 그룹 구분용 키(폴더/식별자). 없으면 'default'로 처리.",
     ),
     maxClips: int = Query(settings.MAX_CLIPS, description="최대 클립 수"),
-    body: dict = Body(
-        default={},
-        description="옵션: {progressCallbackUrl, completedCallbackUrl} (Spring가 받을 엔드포인트)"
-    ),
+    body: dict = Body(default={}, description="옵션: 콜백 URL {progressCallbackUrl, completedCallbackUrl}"),
 ):
     """
-    - presigned 업로드가 끝난 뒤 Spring이 호출
-    - send-img를 통해 등번호가 캐시에 있어야 함
-    - 비동기로 처리 시작 → 즉시 202 응답
+    업로드 완료 후 호출되어 AI Worker에 Job을 큐잉.
+    - 등번호는 /api/send-img 로 캐시에 저장된 값을 사용
+    - 병합본 경로: {SAVE_ROOT}/{uploadId}/{fileName} 형태로 탐색
     """
-    req_id = uuid.uuid4().hex[:8]
+    # 1) 등번호 확인 (요구사항 유지)
+    if memberId not in JERSEY_CACHE:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "jersey_missing", "detail": "jersey number not found in cache. Call /api/send-img first."}
+        )
+    jersey_number = JERSEY_CACHE[memberId]
+
+    # 2) Job 상태 임시 저장
     job = JobState(uploadId, memberId, highlight_key=highlightKey)
-    job.requestId = req_id
     JOBS[uploadId] = job
 
-    progress_url = (body or {}).get("progressCallbackUrl")
-    completed_url = (body or {}).get("completedCallbackUrl")
+    # 3) 병합본 실제 파일 경로 찾기
+    merged = _find_merged_original(uploadId)
+    if not merged:
+        logger.error(f"[process] merged original not found under {settings.SAVE_ROOT}/{uploadId}")
+        return JSONResponse(
+            status_code=404,
+            content={"error": "original_not_found", "detail": f"merged original not found: {settings.SAVE_ROOT}/{uploadId}"}
+        )
+    original_file_path = str(merged)
 
-    logger.info(f"[process] [{req_id}] start uploadId={uploadId} memberId={memberId} "
-                f"progressUrl={progress_url} completedUrl={completed_url}")
+    # 4) AI Worker 페이로드 (요청대로 '3필드만')
+    job_payload = AITaskPayload(
+        jobId=uploadId,
+        memberId=memberId,
+        originalFilePath=original_file_path,
+    )
 
-    # 바로 진행률 0% 알림 한번
-    await _notify(job, progress_url, None)
+    logger.info(
+        f"[process] Queueing job: uploadId={uploadId}, memberId={memberId}, jersey={jersey_number}, "
+        f"highlightKey={highlightKey}, maxClips={maxClips}, original={original_file_path}"
+    )
 
-    # 백그라운드 실행
-    background.add_task(_run_job, job, progress_url, completed_url, maxClips)
+    # 5) Redis Queue에 Job 넣기
+    try:
+        await _queue_ai_worker_job(job_payload)
+    except ConnectionError as e:
+        logger.error(f"[process] Redis Connection Error (Queueing): {e}")
+        JOBS[uploadId].status = "error"
+        JOBS[uploadId].error = "Redis connection failed for queueing."
+        return JSONResponse(
+            status_code=503,
+            content={"error": "queue_unreachable", "detail": "Cannot connect to Redis queue service."}
+        )
+
+    # 6) Pub/Sub 알림 (요구사항 유지)
+    await _publish_progress_async(
+        job_id=uploadId,
+        status=UploadStatus.AI_START_PENDING,
+        message=f"Job queued successfully. Jersey: {jersey_number}",
+        current=0,
+        total=1,
+    )
+
+    # 7) 202 Accepted
     response_payload = {
         "status": 202,
         "success": True,
+        "message": "Job successfully queued for AI Worker and Spring notified.",
         "uploadId": uploadId,
         "memberId": memberId,
-        "requestId": req_id,
+        "jerseyNumber": jersey_number,
+        "highlightKey": highlightKey,
+        "maxClips": maxClips,
+        "originalFilePath": original_file_path,
     }
-    if highlightKey:
-        response_payload["highlightKey"] = highlightKey
-
     return JSONResponse(status_code=202, content=response_payload)
 
-
-@router.get("/process/{uploadId}/status", summary="Get processing status")
+# ─────────────────────────
+# 상태 조회 (디버깅용)
+# ─────────────────────────
+@router.get("/process/{uploadId}/status", summary="Get processing status (from in-memory or Redis/DB)")
 async def get_status(uploadId: str):
     job = JOBS.get(uploadId)
     if not job:
-        return JSONResponse(status_code=404, content={"status": "error", "message": "job not found"})
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "message": "job not found in local memory."}
+        )
     return {
         "status": job.status,
         "progress": round(job.progress, 1),
@@ -236,13 +198,19 @@ async def get_status(uploadId: str):
         "memberId": job.memberId,
         "requestId": job.requestId,
         "error": job.error,
-        "hasResult": bool(job.resultZip and job.resultZip.exists()),
-        "downloadUrl": (f"/api/process/{uploadId}/result" if job.resultZip and job.resultZip.exists() else None),
+        "resultUrl": job.resultUrl,
+        "highlightKey": job.highlightKey,
     }
 
-@router.get("/process/{uploadId}/result", summary="Download ZIP if ready")
+# ─────────────────────────
+# 결과 다운로드(DEPRECATED)
+# ─────────────────────────
+@router.get("/process/{uploadId}/result", summary="Download ZIP if ready - DEPRECATED")
 async def get_result(uploadId: str):
-    job = JOBS.get(uploadId)
-    if not job or job.status != "done" or not job.resultZip or not job.resultZip.exists():
-        return JSONResponse(status_code=404, content={"status": "error", "message": "result not ready"})
-    return FileResponse(path=job.resultZip, filename=job.resultZip.name, media_type="application/zip")
+    return JSONResponse(
+        status_code=404,
+        content={
+            "status": "error",
+            "message": "Download endpoint is deprecated. Use the static file URL provided in the completion callback."
+        }
+    )

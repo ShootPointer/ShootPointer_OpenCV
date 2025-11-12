@@ -1,4 +1,3 @@
-# app/main.py
 from __future__ import annotations
 
 import logging
@@ -17,12 +16,14 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
-# --- Redis imports (기능 유지) ---
+
+# --- Redis imports ---
 from app.core.redis_client import init_redis, close_redis, get_redis_client
 
 from app.core.config import settings
 from app.core.logging import setup_logging
-from app.routers import highlight, player, frames, presigned_upload, process, ai_demo
+# 필요한 라우터만 포함: player(OCR), presigned_upload(청크 업로드), process(병합 시작)
+from app.routers import player, presigned_upload, process
 
 # ─────────────────────────────────────────────────────────────
 # 로깅 초기화
@@ -81,7 +82,6 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
 
 # ─────────────────────────────────────────────────────────────
 # 미들웨어: 업로드 용량 제한 (Content-Length 기반)
-#  - .env의 MAX_UPLOAD_BYTES 초과 시 413 반환
 # ─────────────────────────────────────────────────────────────
 class UploadLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -98,7 +98,6 @@ class UploadLimitMiddleware(BaseHTTPMiddleware):
                             content={"error": "payload_too_large", "detail": "upload exceeds MAX_UPLOAD_BYTES"},
                         )
         except Exception as e:
-            # 제한 체크 실패 시 통과(로그만 남김)
             logger.warning(f"Upload limit check failed: {e}")
 
         return await call_next(request)
@@ -109,13 +108,15 @@ app.add_middleware(UploadLimitMiddleware)
 
 
 # ─────────────────────────────────────────────────────────────
-# 유틸: 실행파일 버전/존재 확인
+# 유틸: 실행파일 버전/존재 확인 (FFmpeg, FFprobe)
 # ─────────────────────────────────────────────────────────────
 def _which(cmd: str) -> Optional[str]:
+    """시스템 경로에서 실행 파일 존재 여부를 확인합니다."""
     return shutil.which(cmd)
 
 
 def _run_out(args: list[str]) -> tuple[bool, str]:
+    """외부 명령어를 실행하고 결과를 반환합니다."""
     try:
         out = subprocess.check_output(args, stderr=subprocess.STDOUT, timeout=5).decode(
             "utf-8", errors="ignore"
@@ -126,6 +127,7 @@ def _run_out(args: list[str]) -> tuple[bool, str]:
 
 
 def _check_ff_binaries() -> dict:
+    """ffmpeg, ffprobe 존재 여부 및 버전 정보를 확인합니다."""
     ok_ffmpeg = _which("ffmpeg") is not None
     ok_ffprobe = _which("ffprobe") is not None
     ffmpeg_ver = _run_out(["ffmpeg", "-version"])[1] if ok_ffmpeg else "not found"
@@ -138,13 +140,8 @@ def _check_ff_binaries() -> dict:
     }
 
 
-def _check_font() -> dict:
-    font = os.getenv("DRAW_FONTFILE") or "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-    exists = os.path.exists(font)
-    return {"font_path": font, "exists": exists}
-
-
 def _check_save_root() -> dict:
+    """최종 저장 경로의 존재 여부 및 쓰기 가능 여부를 확인합니다."""
     root = settings.SAVE_ROOT
     ok_path = True
     ok_write = True
@@ -165,6 +162,7 @@ def _check_save_root() -> dict:
 
 
 def _check_static_mount() -> dict:
+    """정적 파일 서빙 URL 및 마운트 경로를 확인합니다."""
     parsed = urlparse(settings.STATIC_BASE_URL)
     return {
         "STATIC_BASE_URL": settings.STATIC_BASE_URL,
@@ -196,7 +194,6 @@ async def _startup_selfcheck():
         await init_redis()
         logger.info("[startup] Redis connection established successfully.")
     except Exception as e:
-        # Redis 실패해도 서버 기동은 하되 로그 남김
         logger.error(f"[startup] FATAL ERROR: Failed to connect to Redis. Functionality limited. Error: {e}")
 
     # 환경 요약 로그
@@ -211,12 +208,10 @@ async def _startup_selfcheck():
     logger.info(f"[startup] ENV: {env_summary}")
 
     ff = _check_ff_binaries()
-    font = _check_font()
     sr = _check_save_root()
     st = _check_static_mount()
 
     logger.info(f"[startup] ffmpeg/ffprobe: {ff}")
-    logger.info(f"[startup] font: {font}")
     logger.info(f"[startup] static mount: {st}")
     if not sr["dir_ok"] or not sr["writable"]:
         logger.error(f"[startup] SAVE_ROOT not writable: {sr}")
@@ -249,7 +244,6 @@ def debug_selfcheck():
             "FFMPEG_TIMEOUT_SEC": settings.FFMPEG_TIMEOUT_SEC,
         },
         "ffmpeg": _check_ff_binaries(),
-        "font": _check_font(),
         "save_root": _check_save_root(),
         "static_mount": _check_static_mount(),
         "status": "ok",
@@ -291,7 +285,8 @@ async def health():
     try:
         redis_client = get_redis_client()
         if redis_client:
-            await redis_client.ping()  # redis.asyncio 사용 가정
+            # Redis가 비동기 클라이언트임을 가정하고 ping 사용
+            await redis_client.ping()
             redis_status = "OK"
         else:
             redis_status = "ERROR - Redis client not initialized"
@@ -302,11 +297,9 @@ async def health():
 
 
 # ─────────────────────────────────────────────────────────────
-# 라우터 등록
+# 라우터 등록 (게이트웨이/업로드/OCR 관련 기능만 유지)
 # ─────────────────────────────────────────────────────────────
-app.include_router(highlight.router)
-app.include_router(player.router)
-app.include_router(frames.router)
-app.include_router(presigned_upload.router)
-app.include_router(process.router)
-app.include_router(ai_demo.router, prefix="")
+app.include_router(player.router)        # 등번호 OCR (단일 이미지)
+app.include_router(presigned_upload.router) # 청크 업로드
+app.include_router(process.router)       # 병합 시작
+# 불필요한 라우터 제거: highlight, frames, ai_demo

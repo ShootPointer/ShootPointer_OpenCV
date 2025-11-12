@@ -1,56 +1,42 @@
+version: "3.9"
+
 services:
   fast-api:
     build: .
+    container_name: fast-api
     ports:
       - "8000:8000"
     env_file:
       - .env
     environment:
-      # ── 로컬 오버라이드( .env 값을 안전하게 덮어씀 ) ─────────────
-      - SAVE_ROOT=/data/highlights
-      - STATIC_BASE_URL=http://localhost:8000/static/highlights
-      - REDIS_URL=redis://redis:6379/0
-      - MAX_UPLOAD_BYTES=838860800            # 800MB
-      - PLAN_REGISTRY_PY=app/data/registry.py
-      - ALLOW_ORIGINS=http://localhost:3000
-
-      # ffmpeg/오버레이 파라미터(이미지 안 폰트 경로 사용)
-      - DRAW_FONTFILE=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
-      - SHORTS_WIDTH=1080
-      - SHORTS_HEIGHT=1920
-      - FFMPEG_PRESET=veryfast
-      - FFMPEG_CRF=20
-      - FFMPEG_ABR=128k
-
-      # 디텍션/로그(필요시)
-      - SCALE_BASE=960
-      - BALL_HSV_MIN=5,60,60
-      - BALL_HSV_MAX=25,255,255
-      - LOG_LEVEL=INFO
-
+      REDIS_URL: redis://host.docker.internal:6379/0
     volumes:
-      - ./data/highlights:/data/highlights       # 결과 파일 로컬에 보이게 마운트
-    depends_on:
-      redis:
-        condition: service_healthy
-    networks: [app-net]
+      - /mnt/highlights:/data/highlights   # ← NFS 마운트 지점 사용
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
-    # (Linux에서 host 접근 필요할 때만)
-    # extra_hosts:
-    #   - "host.docker.internal:host-gateway"
+    networks:
+      app-net: {}   # ← 리스트가 아니라 매핑!
 
-  redis:
-    image: redis:7-alpine
-    networks: [app-net]
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "redis-cli -h 127.0.0.1 -p 6379 ping || exit 1"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-    # 로컬 개발이면 외부 포트 노출 불필요라 기본 비공개로 둠
-    # ports:
-    #   - "6379:6379"
+  ai_worker:
+    build:
+      context: ./ai_worker
+      dockerfile: Dockerfile
+    container_name: ai_worker_simulator
+    environment:
+      REDIS_URL: redis://host.docker.internal:6379/0
+      SPRING_API_URL: http://host.docker.internal:8080/api/v1/jobs
+      OUTPUT_DIR: /data/highlights/processed
+      PROGRESS_CHANNEL_PREFIX: opencv-progress-highlight
+      REDIS_AI_JOB_QUEUE: opencv-ai-job-queue
+      PYTHONPATH: /app:/app/ai_worker   # ← ai_modules 등 패키지 인식 보강
+    volumes:
+      - /mnt/highlights:/data/highlights   # ← NFS 마운트 지점 사용
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: on-failure
+    networks:
+      app-net: {}   # ← 매핑
 
 networks:
   app-net:

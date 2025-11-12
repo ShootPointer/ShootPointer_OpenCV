@@ -1,115 +1,57 @@
+# app/routers/player.py
 from __future__ import annotations
 
 import logging
-import shutil
-import uuid
-import re
 import json
+import re
 import time
-from pathlib import Path
-from typing import List, Tuple, Dict, Optional
-
-from fastapi import (
-    APIRouter, UploadFile, File, Form, Request, HTTPException
-)
-from fastapi.responses import JSONResponse, StreamingResponse
-from starlette import status
+from typing import Dict, Optional
 
 import cv2
 import numpy as np
+from fastapi import APIRouter, UploadFile, File, Form, Request
+from fastapi.responses import JSONResponse
+from starlette import status
 
 from app.core.config import settings
 from app.services.jersey import (
     ocr_jersey_image_bytes,
-    detect_player_segments,
-    # 힌트 기반 랭킹 버전이 jersey.py에 있다면 사용
-    # (없으면 아래 try/except NameError 폴백)
-    # ocr_jersey_image_bytes_with_hint,
+    ocr_jersey_image_bytes_with_hint,
 )
-from app.services.pipeline import generate_highlight_clips
-from app.services.streaming import build_zip_spooled, stream_zip_and_cleanup
 
 router = APIRouter(prefix="/api", tags=["player"])
 logger = logging.getLogger(__name__)
 
-# 업로드 임시 폴더
-TMP_DIR = Path("/tmp/uploads")
-TMP_DIR.mkdir(parents=True, exist_ok=True)
-
-# 간단 캐시: memberId -> 등번호
+# 단순 캐시: memberId -> 등번호
 JERSEY_CACHE: Dict[str, int] = {}
 
 # ───────────────────────── helpers ─────────────────────────
-def _save_upload(video: UploadFile) -> Path:
-    suffix = Path(video.filename or "").suffix or ".mp4"
-    tmp = TMP_DIR / f"{uuid.uuid4().hex}{suffix}."
-    with tmp.open("wb") as f:
-        shutil.copyfileobj(video.file, f)
-    try:
-        size = tmp.stat().st_size
-    except Exception:
-        size = -1
-    logger.info(f"[upload] saved -> {tmp.name} ({size} bytes)")
-    return tmp
-
-def _in_any_segment(t: float, segments: List[Tuple[float, float]]) -> bool:
-    for s, e in segments:
-        if s <= t <= e:
-            return True
-    return False
-
-def _parse_timestamps(raw: str) -> List[float]:
-    out: List[float] = []
-    for part in (raw or "").replace(";", ",").split(","):
-        p = part.strip()
-        if not p:
-            continue
-        try:
-            v = float(p)
-            if v >= 0:
-                out.append(v)
-        except Exception:
-            pass
-    return sorted(set(out))
-
 def _get_member_id(req: Request) -> str:
     return req.headers.get("X-Member-Id") or "__GLOBAL__"
 
 def _digits_only(s: Optional[str]) -> str:
-    """문자열에서 숫자만 추출(공백/하이픈 등 제거)."""
     return "".join(re.findall(r"\d+", s or ""))
 
 def _is_allowed_image_type(content_type: str | None) -> bool:
-    return (content_type or "").lower() in {
-        "image/jpeg",
-        "image/jpg",
-    }
+    return (content_type or "").lower() in {"image/jpeg", "image/jpg"}
 
 # ───────────────────── 1) 이미지 수신 & OCR ─────────────────────
 @router.post("/send-img", summary="Ocr From Image (camelCase only)")
 async def send_img(
     request: Request,
-    image: UploadFile = File(..., alias="image", description="등번호가 보이는 이미지"),
-    # ✅ 카멜식만 허용
-    backNumber: str | None = Form(None, alias="backNumber", description="(선택) 기대 등번호(문자열 허용)"),
-    backNumberRequestDto: str | None = Form(
-        None,
-        alias="backNumberRequestDto",
-        description="(선택) 기대 등번호 JSON, 예:{'backNumber':10}",
-    ),
+    image: UploadFile = File(..., alias="image", description="등번호가 보이는 이미지(JPEG)"),
+    backNumber: str | None = Form(None, alias="backNumber"),
+    backNumberRequestDto: str | None = Form(None, alias="backNumberRequestDto"),
 ):
     """
     이미지에서 등번호를 OCR로 추출해 캐시에 저장.
-    - 헤더 `X-Member-Id` 로 사용자 구분(없으면 __GLOBAL__).
-    - backNumber는 '문자열'로 받고 내부에서 숫자만 추출해 비교/힌트로 사용.
-    - 성공: 200 {status:200, success:true, backNumber, confidence, match}
-    - 유효성/처리 실패: 4xx {status:'error', step, message, memberId}
+    - 헤더 X-Member-Id 로 사용자 구분(없으면 __GLOBAL__).
+    - 힌트(backNumber/Dto)는 숫자만 추출해 비교/가중치로 사용.
     """
     t0 = time.perf_counter()
     step = "start"
     member_id = _get_member_id(request)
 
-    # 입력 로깅(민감정보 제외) — camelCase만
     logger.info(
         f"[/send-img] member={member_id}, filename={image.filename}, "
         f"content_type={image.content_type}, backNumber_raw={backNumber!r}, "
@@ -117,17 +59,14 @@ async def send_img(
     )
 
     try:
-        # ── 1) 컨텐츠 타입/사이즈 검증
+        # 타입/크기 검사
         step = "validate_input"
         if not _is_allowed_image_type(image.content_type):
             return JSONResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                content={"status": "error", "step": step,
-                         "message": "지원하지 않는 이미지 타입입니다. JPEG만 지원합니다.",
-                         "memberId": member_id},
+                content={"status": "error", "step": step, "message": "JPEG만 지원합니다.", "memberId": member_id},
             )
 
-        # 파일 읽기
         step = "read_image"
         img_bytes = await image.read()
         if not img_bytes:
@@ -143,7 +82,7 @@ async def send_img(
                          "memberId": member_id},
             )
 
-        # ── 2) 디코드 & 기본 정보 로깅
+        # 디코드 및 필요 시 리사이즈
         step = "decode_image"
         try:
             arr = np.frombuffer(img_bytes, dtype=np.uint8)
@@ -151,7 +90,7 @@ async def send_img(
             if bgr is None:
                 raise ValueError("이미지 디코드 실패")
             H, W = bgr.shape[:2]
-            logger.info(f"[/send-img] decoded image size = {W}x{H}")
+            logger.info(f"[/send-img] decoded {W}x{H}")
         except Exception as e:
             logger.exception(f"[/send-img] decode failed: {e}")
             return JSONResponse(
@@ -159,7 +98,6 @@ async def send_img(
                 content={"status": "error", "step": step, "message": "이미지 디코드 실패", "memberId": member_id},
             )
 
-        # ✅ 2-1) 너무 크면 리사이즈 후, JPEG로 재인코딩하여 OCR 입력 바이트 교체
         step = "resize_if_needed"
         try:
             shorter = min(W, H)
@@ -167,204 +105,84 @@ async def send_img(
                 scale = 1000.0 / float(shorter)
                 bgr = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
                 H, W = bgr.shape[:2]
-                ok, enc = cv2.imencode(
-                    ".jpg",
-                    bgr,
-                    [cv2.IMWRITE_JPEG_QUALITY, 90],
-                )
-                if not ok:
-                    raise ValueError("리사이즈 후 인코딩 실패")
-                img_bytes = enc.tobytes()
-                logger.info(f"[/send-img] resized for OCR = {W}x{H}")
+                ok, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                if ok:
+                    img_bytes = enc.tobytes()
+                logger.info(f"[/send-img] resized to {W}x{H}")
         except Exception as e:
-            logger.warning(f"[/send-img] resize skipped due to error: {e}")
+            logger.warning(f"[/send-img] resize skipped: {e}")
 
-        # DEBUG 모드면 OCR 주요 세팅 로그
         if settings.DEBUG_OCR:
-            try:
-                logger.debug(
-                    f"[/send-img] DEBUG_OCR on — "
-                    f"OEM={settings.JERSEY_TESSERACT_OEM}, "
-                    f"PSMs={getattr(settings, 'OCR_PSMS', None)}, "
-                    f"SCALES={getattr(settings, 'OCR_SCALES', None)}, "
-                    f"INVERT={getattr(settings, 'OCR_TRY_INVERT', None)}, "
-                    f"TIMEOUT={settings.OCR_TIMEOUT_SEC}s"
-                )
-            except Exception:
-                pass
+            logger.debug(
+                f"[/send-img] DEBUG_OCR OEM={settings.JERSEY_TESSERACT_OEM}, "
+                f"PSMs={getattr(settings, 'OCR_PSMS', None)}, "
+                f"SCALES={getattr(settings, 'OCR_SCALES', None)}, "
+                f"INVERT={getattr(settings, 'OCR_TRY_INVERT', None)}, "
+                f"TIMEOUT={settings.OCR_TIMEOUT_SEC}s"
+            )
 
-        # ── 3) OCR
+        # 힌트 파싱
         step = "ocr"
         expected_digits = ""
         if backNumberRequestDto:
             try:
                 parsed = json.loads(backNumberRequestDto)
-                if isinstance(parsed, dict):
-                    candidate = parsed.get("backNumber")
-                    if candidate is not None:
-                        expected_digits = _digits_only(str(candidate))
+                if isinstance(parsed, dict) and parsed.get("backNumber") is not None:
+                    expected_digits = _digits_only(str(parsed["backNumber"]))
             except Exception as e:
                 logger.warning(f"[/send-img] backNumberRequestDto parse failed: {e}")
         if not expected_digits and backNumber:
             expected_digits = _digits_only(backNumber)
-        try:
-            # 힌트 기반 함수가 있으면 사용, 없으면 기본 함수 사용
-            from app.services.jersey import ocr_jersey_image_bytes_with_hint  # type: ignore
-            if expected_digits:
-                digits, conf = ocr_jersey_image_bytes_with_hint(img_bytes, expected_digits)
-            else:
-                digits, conf = ocr_jersey_image_bytes(img_bytes)
-        except Exception as e:
-            logger.warning(f"[/send-img] hint OCR unavailable or failed: {e}")
+
+        # OCR 실행
+        if expected_digits:
+            digits, conf = ocr_jersey_image_bytes_with_hint(img_bytes, expected_digits)
+        else:
             digits, conf = ocr_jersey_image_bytes(img_bytes)
 
         logger.info(f"[/send-img] OCR -> digits={digits!r}, conf={conf:.2f}, member={member_id}")
 
-        # [⭐ 수정/추가 부분 시작 ⭐]
-        # 3-1) 정확도(Confidence) 임계값 검사 로직 추가 (요청하신 0.5 아래 예외)
-        # settings.JERSEY_OCR_CONFIDENCE_THRESHOLD 가 없으면 기본값 0.5 사용
-        conf_threshold = getattr(settings, 'JERSEY_OCR_CONFIDENCE_THRESHOLD', 0.5)
-
-        # conf는 0.0 ~ 1.0 사이의 값으로 가정 (Tesseract의 Conf는 보통 0~100이지만, 서비스 레이어에서 0.0~1.0으로 정규화되었다고 가정)
-        if conf < conf_threshold:
-            logger.warning(f"[/send-img] OCR confidence ({conf:.2f}) below threshold ({conf_threshold:.2f})")
+        # 임계값 검증(기본 0.5)
+        conf_threshold = getattr(settings, "JERSEY_OCR_CONFIDENCE_THRESHOLD", 0.5)
+        if conf < conf_threshold or not digits:
             return JSONResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                content={"status": "error", "step": "ocr_confidence_check", 
-                         "message": f"등번호 인식 정확도 ({conf:.2f})가 낮아 추출에 실패했습니다. (임계값: {conf_threshold:.2f})", 
+                content={"status": "error", "step": "ocr_confidence_check",
+                         "message": f"인식 정확도({conf:.2f})가 낮습니다(임계값 {conf_threshold:.2f}).",
                          "memberId": member_id},
             )
-        # [⭐ 수정/추가 부분 끝 ⭐]
 
-        if not digits:
-            return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                content={"status": "error", "step": step, "message": "숫자 인식 실패", "memberId": member_id},
-            )
-
-        # ── 4) 캐시 저장 및 기대값 비교
-        step = "cache"
+        # 캐시 저장 + 기대값 비교
         try:
             detected = int(digits)
         except Exception:
             detected = int(_digits_only(digits) or "0")
-        
-        # 0번은 유효하지 않은 등번호로 간주
         if detected == 0:
-             return JSONResponse(
+            return JSONResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                content={"status": "error", "step": step, "message": "유효하지 않은 등번호(0)가 인식되었습니다.", "memberId": member_id},
+                content={"status": "error", "step": "cache",
+                         "message": "유효하지 않은 등번호(0)입니다.", "memberId": member_id},
             )
-
         JERSEY_CACHE[member_id] = detected
 
         match: Optional[bool] = None
         if expected_digits:
             try:
-                expected_num = int(expected_digits)
-                match = (expected_num == detected)
+                match = (int(expected_digits) == detected)
             except Exception:
                 match = None
 
-        # ── 5) 정상 응답 (백엔드 포맷)
-        step = "done"
+        # 성공
+        dur_ms = (time.perf_counter() - t0) * 1000
         return {
             "status": 200,
             "success": True,
             "backNumber": detected,
             "confidence": conf,
             "match": match,
+            "elapsedMs": round(dur_ms, 1),
         }
 
     except Exception as e:
         logger.exception(f"[/send-img] failed at step={step}: {e}")
-        # 최종 에러를 400 대신 500 또는 다른 적절한 에러로 처리할 수 있습니다.
-        # 현재는 기존 코드의 400을 유지합니다.
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={"status": "error", "step": step, "message": str(e), "memberId": member_id},
-        )
-
-
-# ─────────────── 2) 세그먼트 검출 (번호는 캐시에서) ───────────────
-@router.post("/segments", summary="Detect Segments")
-async def segments(
-    request: Request,
-    videoFile: UploadFile = File(..., alias="videoFile", description="풀경기 영상(mp4 등)"),
-):
-    member_id = _get_member_id(request)
-    if member_id not in JERSEY_CACHE:
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"error": "등번호 정보가 없습니다. 먼저 /api/send-img 로 이미지를 보내주세요.",
-                     "memberId": member_id},
-        )
-
-    jersey_number = JERSEY_CACHE[member_id]
-    tmp_in = _save_upload(videoFile)
-
-    try:
-        segs = detect_player_segments(tmp_in, jersey_number)
-        logger.info(f"[/segments] member={member_id} jersey={jersey_number} segs={len(segs)}")
-        return {"segments": segs, "jerseyNumber": jersey_number, "memberId": member_id}
-    except Exception as e:
-        logger.exception(f"[/segments] failed: {e}")
-        return JSONResponse(status_code=400, content={"error": str(e), "memberId": member_id})
-    finally:
-        try:
-            tmp_in.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-# ─────────────── 3) 하이라이트 ZIP 생성 (번호는 캐시에서) ───────────────
-@router.post("/highlight", summary="Generate Highlights Zip")
-async def highlight(
-    request: Request,
-    videoFile: UploadFile = File(..., alias="videoFile", description="풀경기 영상(mp4 등)"),
-    timestamps: str = Form(..., alias="timestamps", description="쉼표구분 초 리스트, 예: 30,75,120"),
-    pre: float = Form(default=settings.DEFAULT_PRE, alias="pre"),
-    post: float = Form(default=settings.DEFAULT_POST, alias="post"),
-    maxClips: int = Form(default=settings.MAX_CLIPS, alias="maxClips"),
-):
-    member_id = _get_member_id(request)
-    if member_id not in JERSEY_CACHE:
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"error": "등번호 정보가 없습니다. 먼저 /api/send-img 로 이미지를 보내주세요.",
-                     "memberId": member_id},
-        )
-
-    jersey_number = JERSEY_CACHE[member_id]
-    tmp_in = _save_upload(videoFile)
-    clip_paths: List[Path] = []
-    tmp_to_cleanup: List[Path] = [tmp_in]
-
-    try:
-        segs = detect_player_segments(tmp_in, jersey_number)
-
-        events = _parse_timestamps(timestamps)
-        events = [t for t in events if _in_any_segment(t, segs)] if segs else events
-        if not events:
-            raise RuntimeError("선수 구간과 겹치는 이벤트가 없습니다. (timestamps 확인)")
-
-        if maxClips and maxClips > 0:
-            events = events[:maxClips]
-
-        logger.info(f"[/highlight] member={member_id} jersey={jersey_number} events={events}")
-
-        results = generate_highlight_clips(
-            tmp_in, jersey_number, events, pre=pre, post=post, max_clips=maxClips
-        )
-        clip_paths = [Path(p) for _, p in results]
-
-        spooled = build_zip_spooled(clip_paths, arc_prefix=f"#{jersey_number}_")
-        return stream_zip_and_cleanup(spooled, clip_paths, tmp_to_cleanup)
-
-    except Exception as e:
-        logger.exception(f"[/highlight] failed: {e}")
-        for p in clip_paths:
-            try: Path(p).unlink(missing_ok=True)
-            except Exception: pass
-        try: Path(tmp_in).unlink(missing_ok=True)
-        except Exception: pass
-        return JSONResponse(status_code=400, content={"error": str(e), "memberId": member_id})
+        return JSONResponse(status_code=500, content={"status": "error", "step": step, "message": str(e)})

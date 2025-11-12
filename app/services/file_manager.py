@@ -1,11 +1,14 @@
+# app/services/file_manager.py
+import os
 import logging
 import time
 import shutil
 import json
 import asyncio
-import hashlib 
+import hashlib
+from uuid import uuid4
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from redis.asyncio import Redis, ConnectionError as RedisConnectionError
 
@@ -20,6 +23,10 @@ def get_status_key(job_id: str) -> str:
     """Redis에서 작업 상태를 저장하는 키를 반환합니다."""
     return f"job:{job_id}:status"
 
+def get_meta_key(job_id: str) -> str:
+    """작업 메타데이터(멤버, 하이라이트키, 원본경로)를 저장하는 키."""
+    return f"job:{job_id}:meta"
+
 # ─────────────────────────────────────────────────────────────
 # 유틸리티 함수
 # ─────────────────────────────────────────────────────────────
@@ -28,18 +35,19 @@ def calculate_file_checksum(file_path: Path) -> str:
     """주어진 파일 경로의 SHA256 체크섬을 계산합니다."""
     hasher = hashlib.sha256()
     try:
-        # 파일을 바이너리 모드로 읽고, 청크 단위로 해시 업데이트
         with file_path.open('rb') as f:
-            while chunk := f.read(8192): # 8KB 청크
+            while True:
+                chunk = f.read(8192)  # 8KB 청크
+                if not chunk:
+                    break
                 hasher.update(chunk)
-        # 'sha256:' 접두사 포함하여 반환
         return f"sha256:{hasher.hexdigest()}"
     except Exception as e:
         logger.error(f"Failed to calculate checksum for {file_path}: {e}")
-        return "sha256:error" # 오류 발생 시 오류 값 반환
+        return "sha256:error"
 
 # ─────────────────────────────────────────────────────────────
-# 진행률 보고 로직
+# 진행률/완료 보고 로직
 # ─────────────────────────────────────────────────────────────
 
 async def report_progress_to_spring(job_id: str, status: str, progress: float):
@@ -48,20 +56,21 @@ async def report_progress_to_spring(job_id: str, status: str, progress: float):
     """
     try:
         redis: Redis = get_redis_client()
-    except ConnectionError as e:
+    except RedisConnectionError as e:
         logger.error(f"Redis not available, cannot report status for Job {job_id}: {e}")
+        return
+    except Exception as e:
+        logger.error(f"Unknown error getting Redis client for Job {job_id}: {e}")
         return
 
     try:
-        # 상태 JSON (Spring 서버와의 약속된 포맷)
         status_data = {
             "jobId": job_id,
             "status": status,
             "progress": f"{progress:.2f}",
             "timestamp": int(time.time())
         }
-        
-        await redis.set(get_status_key(job_id), json.dumps(status_data), ex=3600) 
+        await redis.set(get_status_key(job_id), json.dumps(status_data), ex=3600)
         logger.info(f"Job {job_id} status updated: {status} ({progress:.2f}%)")
     except RedisConnectionError as e:
         logger.error(f"Redis connection dropped or operation failed for Job {job_id}: {e}")
@@ -69,38 +78,51 @@ async def report_progress_to_spring(job_id: str, status: str, progress: float):
         logger.error(f"Failed to report status to Redis for Job {job_id}: {e}")
 
 async def report_final_completion_to_spring(
-    job_id: str, 
-    final_file_path: Path, 
-    checksum: str
+    job_id: str,
+    final_file_path: Path,
+    checksum: str,
+    member_id_override: Optional[str] = None,
 ):
     """
     최종 완료된 원본 영상 정보를 Spring 서버에 약속된 JSON 형식으로 Redis를 통해 보고합니다.
     """
     try:
         redis: Redis = get_redis_client()
-    except ConnectionError as e:
+    except RedisConnectionError as e:
         logger.error(f"Redis not available, cannot report final status for Job {job_id}: {e}")
         return
-    
-    # TODO: durationSec, memberId는 실제 토큰 데이터나 미디어 분석 라이브러리(ffprobe)에서 가져와야 합니다.
+    except Exception as e:
+        logger.error(f"Unknown error getting Redis client for Job {job_id}: {e}")
+        return
+
     try:
         file_size_bytes = final_file_path.stat().st_size
-        source_url = f"{settings.EXTERNAL_BASE_URL}/{final_file_path.name}"
-        member_id = settings.MEMBER_ID 
-        duration_sec = 0.0 # 임시 값
+
+        # SAVE_ROOT 기준 상대 경로를 외부 URL에 붙여서 노출
+        try:
+            rel = final_file_path.relative_to(Path(settings.SAVE_ROOT))
+            rel_str = str(rel).replace("\\", "/")
+            source_url = f"{settings.EXTERNAL_BASE_URL}/{rel_str}"
+        except Exception:
+            # 상대 경로 계산 실패 시 파일명만 노출(폴백)
+            source_url = f"{settings.EXTERNAL_BASE_URL}/{final_file_path.name}"
+
+        member_id = member_id_override or settings.MEMBER_ID
+        duration_sec = 0.0  # TODO: 실제 분석 값으로 대체(ffprobe 등)
 
     except Exception as e:
         logger.error(f"Failed to get file stats for final notification: {e}")
         file_size_bytes = 0
         source_url = "error_url"
-        
-    # 최종 완료 JSON 페이로드 구성
+        member_id = member_id_override or settings.MEMBER_ID
+        duration_sec = 0.0
+
     payload = {
         "status": 200,
         "success": True,
         "data": {
             "type": "UPLOAD_COMPLETE",
-            "memberId": member_id, 
+            "memberId": member_id,
             "jobId": job_id,
             "sizeBytes": file_size_bytes,
             "sourceUrl": source_url,
@@ -112,47 +134,72 @@ async def report_final_completion_to_spring(
     }
 
     try:
-        await redis.set(get_status_key(job_id), json.dumps(payload), ex=3600) 
+        await redis.set(get_status_key(job_id), json.dumps(payload), ex=3600)
         logger.info(f"Final completion JSON reported to Redis for Job {job_id}.")
     except Exception as e:
         logger.error(f"Failed to report final completion JSON to Redis for Job {job_id}: {e}")
 
 # ─────────────────────────────────────────────────────────────
+# 메타 저장 유틸
+# ─────────────────────────────────────────────────────────────
+
+async def _save_job_meta(job_id: str, meta: Dict[str, Any]) -> None:
+    """AI 워커/백엔드가 조회할 수 있도록 작업 메타를 Redis에 저장."""
+    try:
+        redis: Redis = get_redis_client()
+    except Exception as e:
+        logger.warning(f"Redis unavailable; meta not saved for {job_id}: {e}")
+        return
+    try:
+        await redis.set(get_meta_key(job_id), json.dumps(meta), ex=86400)  # 1 day
+        logger.info(f"Saved job meta for {job_id}: {meta}")
+    except Exception as e:
+        logger.warning(f"Failed to save job meta for {job_id}: {e}")
+
+# ─────────────────────────────────────────────────────────────
 # AI Worker 연동 로직 (Redis Queue)
 # ─────────────────────────────────────────────────────────────
 
-async def _trigger_ai_worker(job_id: str, final_file_path: Path):
+async def _trigger_ai_worker(job_id: str, final_file_path: Path, member_id: Optional[str], highlight_identifier: str):
     """
-    AI Worker가 처리할 작업 요청을 Redis List(Queue)에 푸시하고, 
+    AI Worker가 처리할 작업 요청을 Redis List(Queue)에 푸시하고,
     Spring 서버에 AI 작업 시작 대기 상태를 보고합니다.
     """
     try:
         redis: Redis = get_redis_client()
-    except ConnectionError:
+    except RedisConnectionError:
         logger.error(f"Redis not available, cannot queue AI task for Job {job_id}.")
+        return
+    except Exception as e:
+        logger.error(f"Unknown error getting Redis client for Job {job_id}: {e}")
         return
 
     # 1. AI Worker에게 전달할 페이로드 구성
     ai_payload = AITaskPayload(
         jobId=job_id,
-        memberId=settings.MEMBER_ID, # TODO: 실제 Member ID 사용
-        originalFilePath=str(final_file_path.resolve()) # 절대 경로를 문자열로 전달
+        memberId=(member_id or settings.MEMBER_ID),
+        # originalFilePath=str(final_file_path.resolve())  # ⬅️ 이전(컨테이너 내부 절대 경로 위험)
+        originalFilePath=str(final_file_path)  # ⬅️ 공유 볼륨 경로 그대로 전달
     )
 
+    # extra 필드(워커 모델에 없어도 무시되도록 JSON에만 포함)
+    payload_dict = json.loads(ai_payload.model_dump_json())
+    payload_dict["highlightIdentifier"] = highlight_identifier  # 추가 메타
+
     try:
-        # 2. Redis List에 PUSH (큐에 넣기)
         push_count = await redis.rpush(
-            settings.AI_QUEUE_NAME, 
-            ai_payload.model_dump_json() # Pydantic 모델을 JSON 문자열로 직렬화
+            getattr(settings, "REDIS_QUEUE_NAME", "opencv-ai-job-queue"),
+            json.dumps(payload_dict)
         )
-        logger.info(f"AI Task for Job {job_id} successfully pushed to queue '{settings.AI_QUEUE_NAME}'. Queue size: {push_count}")
-        
-        # 3. Spring 서버에 AI 작업 시작 대기 상태 보고
+        logger.info(
+            f"AI Task for Job {job_id} pushed to queue '{getattr(settings, 'REDIS_QUEUE_NAME', 'opencv-ai-job-queue')}'. "
+            f"Queue size: {push_count}"
+        )
+
         await report_progress_to_spring(job_id, UploadStatus.AI_START_PENDING.value, 100.0)
 
     except Exception as e:
         logger.error(f"Failed to queue AI task for Job {job_id}: {e}")
-        # AI 큐에 넣는 것까지 실패했다면, Spring에게도 실패를 알려야 합니다.
         await report_progress_to_spring(job_id, UploadStatus.ERROR.value, 0.0)
 
 # ─────────────────────────────────────────────────────────────
@@ -160,64 +207,105 @@ async def _trigger_ai_worker(job_id: str, final_file_path: Path):
 # ─────────────────────────────────────────────────────────────
 
 async def merge_chunks_and_cleanup(
-    job_id: str, 
-    file_name: str, 
-    total_parts: int, 
-    chunk_dir: Path
+    job_id: str,
+    file_name: str,
+    total_parts: int,
+    chunk_dir: Path,
+    member_id: Optional[str] = None,   # ← A-2: 선택 인자 추가 (기존 호출과 호환)
 ):
     """
-    백그라운드에서 실행되는 메인 병합 작업 로직입니다. 
+    백그라운드에서 실행되는 메인 병합 작업 로직입니다.
+    - 청크를 임시 경로에 병합한 뒤
+    - 공유 볼륨(SAVE_ROOT/{job_id}/{file_name})으로 이동
+    - 완료 정보 Redis 보고 및 AI Worker 큐 트리거
     """
+    # 최종 저장 디렉토리(SAVE_ROOT/{job_id})
+    final_save_dir = Path(settings.SAVE_ROOT) / job_id
+    final_save_dir.mkdir(parents=True, exist_ok=True)
+
+    # 최종 저장 경로(SAVE_ROOT/{job_id}/{file_name})
+    final_save_path = final_save_dir / file_name
+
+    # 임시 병합 경로(TEMP_ROOT/temp_{job_id}_{file_name})
+    temp_merge_path = Path(settings.TEMP_ROOT) / f"temp_{job_id}_{file_name}"
+
     final_path: Optional[Path] = None
     calculated_checksum: Optional[str] = None
-    
-    # 1. 상태 보고: 작업 시작 (0%로 초기화)
+
+    # 1) 상태 보고 시작
     await report_progress_to_spring(job_id, "IN_PROGRESS", 0.0)
-    
+
     try:
-        # 2. 청크 파일 목록 정렬 및 최종 검증
+        # 2) 청크 파일 목록 정렬 및 검증
+        #   - 업로드 라우터에서 '{job_id}_{file_name}.{part_index}' 형태로 저장했다고 가정
         chunk_files = sorted(chunk_dir.glob(f"{job_id}_{file_name}.*"))
         if len(chunk_files) != total_parts:
-             raise Exception("Integrity check failure during merge.")
-        
-        # 3. 병합 작업 실행
-        final_path = Path(settings.TEMP_ROOT) / f"{job_id}_{file_name}"
-        logger.info(f"Starting merge of {total_parts} chunks into {final_path}")
-        
-        # 실제 병합 및 진행률 보고 로직 (90%까지)
-        with final_path.open("wb") as outfile:
+            raise Exception(
+                f"Integrity check failure during merge. expected={total_parts}, actual={len(chunk_files)}"
+            )
+
+        logger.info(f"Starting merge of {total_parts} chunks into {temp_merge_path}")
+
+        # 3) 임시 경로에 병합(진행률 0~90%)
+        with temp_merge_path.open("wb") as outfile:
             for i, chunk_file in enumerate(chunk_files):
                 with chunk_file.open("rb") as infile:
-                    # 실제 파일 복사 (병합)
-                    shutil.copyfileobj(infile, outfile) 
-                
-                # 진행률 보고 (병합 진행도)
+                    shutil.copyfileobj(infile, outfile)
                 merge_progress = (i + 1) / total_parts * 90.0
                 await report_progress_to_spring(job_id, "IN_PROGRESS", merge_progress)
-                
-        logger.info(f"Merge completed. Starting checksum calculation.")
 
-        # 4. 체크섬 계산 및 95% 보고
+        logger.info("Merge completed at temp location. Moving to final save dir and calculating checksum.")
+
+        # 3.5) 최종 경로로 이동
+        shutil.move(str(temp_merge_path), str(final_save_path))
+        final_path = final_save_path
+
+        # 4) 체크섬 계산 및 95% 보고(최종 경로 기준)
         calculated_checksum = calculate_file_checksum(final_path)
         await report_progress_to_spring(job_id, "IN_PROGRESS", 95.0)
-        
-        # 5. Spring 서버에 최종 완료 JSON 보고 (Upload 완료)
-        await report_final_completion_to_spring(
-            job_id, 
-            final_path, 
-            calculated_checksum
+
+        # 4.5) 하이라이트 식별자 생성 + 메타 저장
+        highlight_identifier = str(uuid4())
+        await _save_job_meta(
+            job_id,
+            {
+                "memberId": (member_id or settings.MEMBER_ID),
+                "highlightIdentifier": highlight_identifier,
+                "originalFilePath": str(final_path),
+            },
         )
 
-        # 6. AI Worker Queue에 작업 푸시 및 상태 보고
-        await _trigger_ai_worker(job_id, final_path)
-        
+        # 5) 최종 완료 JSON 보고 (멤버 반영)
+        await report_final_completion_to_spring(
+            job_id,
+            final_path,
+            calculated_checksum,
+            member_id_override=member_id,
+        )
+
+        # 6) AI Worker 큐 푸시 및 상태 보고 (하이라이트키 포함)
+        await _trigger_ai_worker(job_id, final_path, member_id, highlight_identifier)
+
     except Exception as e:
-        logger.error(f"Critical error during merge/cleanup/trigger for Job {job_id}: {e}", exc_info=True)
-        # 7. 상태 보고: 작업 실패
+        logger.error(
+            f"Critical error during merge/cleanup/trigger for Job {job_id}: {e}",
+            exc_info=True
+        )
         await report_progress_to_spring(job_id, "FAILED", 0.0)
-        
+
     finally:
-        # 8. 임시 청크 폴더 삭제
-        if chunk_dir.exists():
-            shutil.rmtree(chunk_dir, ignore_errors=True)
-            logger.info(f"Cleanup complete for Job {job_id}: removed {chunk_dir}")
+        # 7) 임시 청크 폴더 삭제
+        try:
+            if chunk_dir.exists():
+                shutil.rmtree(chunk_dir, ignore_errors=True)
+                logger.info(f"Cleanup complete for Job {job_id}: removed chunk dir {chunk_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to remove chunk dir {chunk_dir} for Job {job_id}: {e}")
+
+        # 8) 남아있을 수 있는 임시 병합 파일 제거(이동 실패 등의 경우)
+        try:
+            if temp_merge_path.exists():
+                os.remove(temp_merge_path)
+                logger.info(f"Cleanup complete for Job {job_id}: removed temp file {temp_merge_path}")
+        except Exception as e:
+            logger.warning(f"Failed to remove temp file {temp_merge_path} for Job {job_id}: {e}")

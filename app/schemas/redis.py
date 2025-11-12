@@ -1,4 +1,6 @@
+# app/schemas/redis.py
 from enum import Enum
+from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -44,7 +46,6 @@ class ProgressMessage(BaseModel):
     total: int = Field(default=1, description="전체 진행도 카운트")
     resultUrl: str = Field(default="", description="최종 결과 파일 접근 URL (완료 시)")
 
-
 class AITaskPayload(BaseModel):
     """
     AI Worker Queue (Redis List)에 푸시될 작업 요청 페이로드
@@ -52,4 +53,6 @@ class AITaskPayload(BaseModel):
     jobId: str = Field(..., description="작업 고유 ID")
     memberId: str = Field(..., description="요청 사용자 ID")
     originalFilePath: str = Field(..., description="AI Worker가 접근해야 하는 원본 파일의 임시 저장 경로/URL")
+    # 선택: 하이라이트 식별자(백엔드/리포팅에 활용). 없으면 워커는 무시 가능.
+    highlightIdentifier: Optional[str] = Field(default=None, description="하이라이트 식별자(선택)")
     # TODO: AI 작업의 종류, 파라미터 등 필요한 메타데이터 추가

@@ -1,150 +1,23 @@
 # app/services/jersey.py
 from __future__ import annotations
 
-from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
-import subprocess
 import re
-import tempfile
-import shutil
 import logging
-import time
+from typing import Dict, Any, Tuple, List
 
 import cv2
 import numpy as np
 import pytesseract
 
 from app.core.config import settings
-from app.services.ffmpeg import get_duration
 
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────
-# FFmpeg helpers (타임아웃/로깅 포함)
+# OCR helpers
 # ─────────────────────────────────────
-def _run(cmd: list[str]) -> subprocess.CompletedProcess:
-    """공통 서브프로세스 실행(타임아웃/로깅 포함)"""
-    to = settings.FFMPEG_TIMEOUT_SEC
-    try:
-        logger.debug(f"[jersey.ffproc] exec (timeout={to}s): {' '.join(cmd[:10])} ...")
-        p = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=to,
-        )
-        logger.debug(f"[jersey.ffproc] returncode={p.returncode}")
-        return p
-    except subprocess.TimeoutExpired:
-        logger.warning(f"[jersey.ffproc] timeout after {to}s")
-        raise
-    except Exception as e:
-        logger.exception(f"[jersey.ffproc] failed: {e}")
-        raise
-
-
-# ─────────────────────────────────────
-# 프레임 샘플링 (세그먼트 검출에서 사용)
-# ─────────────────────────────────────
-def _sample_frames_to_dir(video_path: Path, fps: float) -> tuple[Path, list[tuple[float, Path]]]:
-    """
-    ffmpeg로 일정 fps 간격 프레임을 추출하고 showinfo 로그에서 pts_time(초)을 파싱.
-    (옵션) settings.FFMPEG_HWACCEL,* 설정 시 하드웨어 가속 디코딩 사용.
-    반환: (임시폴더경로, [(timestamp_sec, frame_path), ...])
-    """
-    assert video_path.exists(), f"input not found: {video_path}"
-    tmp_dir = Path(tempfile.mkdtemp(prefix="jersey_"))
-    out_pattern = tmp_dir / "f_%05d.jpg"
-
-    # 960px로 스케일 제한(속도/인식 안정성), showinfo로 타임스탬프 얻기
-    vf = f"fps={fps},scale='min(960,iw)':-2,showinfo"
-
-    cmd: list[str] = ["ffmpeg", "-y"]
-
-    # 하드웨어 가속(옵션)
-    if settings.FFMPEG_HWACCEL:
-        cmd += ["-hwaccel", settings.FFMPEG_HWACCEL]
-        if settings.FFMPEG_HWACCEL_DEVICE:
-            cmd += ["-hwaccel_device", settings.FFMPEG_HWACCEL_DEVICE]
-
-    cmd += [
-        "-i", str(video_path),
-        "-vf", vf,
-        "-q:v", "3",
-        str(out_pattern),
-    ]
-
-    proc = _run(cmd)
-
-    times: list[float] = []
-    for line in (proc.stderr or "").splitlines():
-        m = re.search(r"pts_time:([0-9]+\.[0-9]+)", line)
-        if m:
-            try:
-                times.append(float(m.group(1)))
-            except Exception:
-                pass
-
-    images = sorted(tmp_dir.glob("f_*.jpg"))
-    pairs: list[tuple[float, Path]] = []
-    for i, img in enumerate(images):
-        if i < len(times):
-            pairs.append((times[i], img))
-
-    logger.info(f"[jersey.sample] frames={len(pairs)} (fps={fps})")
-    return tmp_dir, pairs
-
-
-# ─────────────────────────────────────
-# ROI 탐색(숫자 후보)
-# ─────────────────────────────────────
-def _digit_roi_candidates(gray: np.ndarray) -> list[np.ndarray]:
-    """
-    숫자 후보 ROI 추출: 블러 → 적응형 이진화 → 모폴로지 → 컨투어 필터.
-    상단 HUD(스코어보드) 오검을 줄이기 위해 화면 상단 일부는 제외.
-    """
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    thr = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 7
-    )
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    mor = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    contours, _ = cv2.findContours(mor, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    rois: list[np.ndarray] = []
-    H, W = gray.shape[:2]
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        # 🔧 잡음 억제: 최소 면적 상향(너무 작은 조각 제거)
-        if w * h < 700:
-            continue
-        ar = w / (h + 1e-6)
-        if ar < 0.3 or ar > 6.0:  # 비정상 종횡비 제외
-            continue
-        if y < H * 0.10:          # 화면 상단 10%는 HUD일 확률↑ → 제외
-            continue
-        x0 = max(0, x - 2)
-        y0 = max(0, y - 2)
-        x1 = min(W, x + w + 2)
-        y1 = min(H, y + h + 2)
-        roi = gray[y0:y1, x0:x1]
-        # 🔧 끊긴 획 보정
-        roi = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, kernel, iterations=1)
-        rois.append(roi)
-    return rois
-
-
-# ─────────────────────────────────────
-# OCR 유틸 (강화 루틴)
-# ─────────────────────────────────────
-def _final_conf(digits: str, conf_vals: list[float]) -> float:
-    """
-    Tesseract conf가 -1 또는 누락되는 경우가 있어 보정 규칙 적용.
-    - conf_vals 있으면 평균 사용
-    - 없으면 자릿수 기반 기본값: 1자리 0.85 / 2자리 0.90 / 그 외 0.80
-    """
+def _final_conf(digits: str, conf_vals: List[float]) -> float:
+    """Tesseract conf 보정: 값이 없으면 자릿수 기반 기본치."""
     if conf_vals:
         return float(np.mean(conf_vals))
     n = len(digits)
@@ -154,12 +27,8 @@ def _final_conf(digits: str, conf_vals: list[float]) -> float:
         return 0.90
     return 0.80
 
-
-def _tess_digits_with_conf(img: np.ndarray, psm: int) -> tuple[str, float]:
-    """
-    pytesseract image_to_data로 숫자와 평균 confidence(0~1)를 얻는다.
-    settings.OCR_TIMEOUT_SEC 적용 + conf 보정.
-    """
+def _tess_digits_with_conf(img: np.ndarray, psm: int) -> Tuple[str, float]:
+    """image_to_data로 숫자+평균 confidence(0~1) 산출."""
     config = (
         f"-l eng --oem {settings.JERSEY_TESSERACT_OEM} "
         f"--psm {psm} -c tessedit_char_whitelist=0123456789"
@@ -172,16 +41,16 @@ def _tess_digits_with_conf(img: np.ndarray, psm: int) -> tuple[str, float]:
             timeout=settings.OCR_TIMEOUT_SEC,
         )
     except RuntimeError as e:
-        logger.warning(f"[jersey.ocr] timeout after {settings.OCR_TIMEOUT_SEC}s: {e}")
+        logger.warning(f"[ocr] timeout after {settings.OCR_TIMEOUT_SEC}s: {e}")
         return "", 0.0
     except Exception as e:
-        logger.exception(f"[jersey.ocr] failed: {e}")
+        logger.exception(f"[ocr] failed: {e}")
         return "", 0.0
 
     texts = data.get("text", []) or []
     confs = data.get("conf", []) or []
     digits = ""
-    conf_vals: list[float] = []
+    conf_vals: List[float] = []
 
     for t, c in zip(texts, confs):
         t = t or ""
@@ -200,148 +69,98 @@ def _tess_digits_with_conf(img: np.ndarray, psm: int) -> tuple[str, float]:
     conf = _final_conf(digits, conf_vals)
     return digits, conf
 
-
-def _prep_variants(bgr: np.ndarray, invert: bool) -> list[np.ndarray]:
-    """
-    다양한 전처리 변형: 그레이, CLAHE, Otsu, Adaptive, Morph
-    """
+def _prep_variants(bgr: np.ndarray, invert: bool) -> List[np.ndarray]:
+    """그레이/CLAHE/Otsu/Adaptive/Morph 변형 세트."""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     if invert:
         gray = cv2.bitwise_not(gray)
 
     outs = [gray]
-
-    # CLAHE
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
     outs.append(clahe)
 
-    # Otsu
     _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
     outs.append(otsu)
 
-    # Adaptive
     adap = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7
     )
     outs.append(adap)
 
-    # Morph close
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     mor = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel, iterations=1)
     outs.append(mor)
 
     return outs
 
-
-def _best_digits_with_hint(digs: list[tuple[str, float]], expected: str | None) -> tuple[str, float]:
-    if not digs:
+def _best_digits_with_hint(cands: List[Tuple[str, float]], expected: str | None) -> Tuple[str, float]:
+    if not cands:
         return "", 0.0
     if expected:
-        def _score(cand: tuple[str, float]):
-            d, c = cand
-            # 정확일치(2) > 부분일치(1) > 불일치(0), 동률이면 conf, 길이차이 작은 쪽
+        def _score(c: Tuple[str, float]):
+            d, conf = c
             pri = 2 if d == expected else (1 if expected in d else 0)
-            return (pri, c, -abs(len(d) - len(expected)))
-        digs = sorted(digs, key=_score, reverse=True)
-        return digs[0]
-    # 힌트 없으면: 길이 우선 → conf
-    digs = sorted(digs, key=lambda x: (len(x[0]), x[1]), reverse=True)
-    return digs[0]
+            return (pri, conf, -abs(len(d) - len(expected)))
+        cands.sort(key=_score, reverse=True)
+        return cands[0]
+    cands.sort(key=lambda x: (len(x[0]), x[1]), reverse=True)
+    return cands[0]
 
-
-def _ocr_try_all(bgr: np.ndarray, expected: str | None = None) -> tuple[str, float, Dict[str, Any]]:
-    """
-    멀티 스케일 × 반전 × 전처리 × PSM 조합으로 최적 결과 탐색.
-    - 예산(콤보 수/총 소요시간) 초과 시 즉시 중단
-    - 힌트(expected)와 정확히 일치하면 즉시 단락(short-circuit)
-    """
+def _ocr_try_all(bgr: np.ndarray, expected: str | None = None) -> Tuple[str, float, Dict[str, Any]]:
+    """스케일×반전×전처리×PSM 조합으로 최적 숫자 탐색."""
     H, W = bgr.shape[:2]
     tried = 0
-    candidates: list[tuple[str, float]] = []
+    cands: List[Tuple[str, float]] = []
 
     scales = getattr(settings, "OCR_SCALES", [1.0]) or [1.0]
     psms = getattr(settings, "OCR_PSMS", [7, 6, 10]) or [7, 6, 10]
     invert_opts = [False, True] if getattr(settings, "OCR_TRY_INVERT", True) else [False]
 
-    # 예산(최대 조합/최대 시간)
     max_combos = int(getattr(settings, "OCR_MAX_COMBOS", 120))
     max_sec = float(getattr(settings, "OCR_MAX_SEC", 8.0))
-    t0 = time.perf_counter()
+    t0 = cv2.getTickCount()
+    tick = cv2.getTickFrequency()
 
     def over_budget() -> bool:
-        return (tried >= max_combos) or ((time.perf_counter() - t0) >= max_sec)
+        return tried >= max_combos or (cv2.getTickCount() - t0) / tick >= max_sec
 
     for s in scales:
         scaled = cv2.resize(bgr, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC) if s != 1.0 else bgr
         for inv in invert_opts:
-            variants = _prep_variants(scaled, invert=inv)
-
-            # ① 전체 이미지
-            for v in variants:
+            for v in _prep_variants(scaled, invert=inv):
                 for psm in psms:
                     tried += 1
-                    digs, cf = _tess_digits_with_conf(v, psm=psm)
+                    digs, cf = _tess_digits_with_conf(v, psm)
                     digs = re.sub(r"\D+", "", digs)
                     if digs:
-                        candidates.append((digs, cf))
+                        cands.append((digs, cf))
                         if expected and digs == expected:
-                            # 예상값 정확 일치 → 즉시 반환
-                            return digs, cf, {
-                                "imageWidth": W, "imageHeight": H,
-                                "triedCombos": tried, "numCandidates": len(candidates),
-                                "shortCircuit": "expected_match"
-                            }
+                            return digs, cf, {"imageWidth": W, "imageHeight": H, "triedCombos": tried, "shortCircuit": "expected_match"}
                     if over_budget():
-                        digits, conf = _best_digits_with_hint(candidates, expected)
-                        dbg = {
-                            "imageWidth": W, "imageHeight": H,
-                            "triedCombos": tried, "numCandidates": len(candidates),
-                            "budgetStop": True
-                        }
-                        return digits, float(conf), dbg
+                        d, c = _best_digits_with_hint(cands, expected)
+                        return d, float(c), {"imageWidth": W, "imageHeight": H, "triedCombos": tried, "budgetStop": True}
 
-            # ② ROI들
-            gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
-            if inv:
-                gray = cv2.bitwise_not(gray)
-            rois = _digit_roi_candidates(gray)
-            for roi in rois:
-                for fx in (1.5, 2.0, 3.0):
-                    roi_big = cv2.resize(roi, None, fx=fx, fy=fx, interpolation=cv2.INTER_CUBIC)
-                    for psm in psms:
-                        tried += 1
-                        digs, cf = _tess_digits_with_conf(roi_big, psm=psm)
-                        digs = re.sub(r"\D+", "", digs)
-                        if digs:
-                            candidates.append((digs, cf))
-                            if expected and digs == expected:
-                                return digs, cf, {
-                                    "imageWidth": W, "imageHeight": H,
-                                    "triedCombos": tried, "numCandidates": len(candidates),
-                                    "shortCircuit": "expected_match"
-                                }
-                        if over_budget():
-                            digits, conf = _best_digits_with_hint(candidates, expected)
-                            dbg = {
-                                "imageWidth": W, "imageHeight": H,
-                                "triedCombos": tried, "numCandidates": len(candidates),
-                                "budgetStop": True
-                            }
-                            return digits, float(conf), dbg
+    d, c = _best_digits_with_hint(cands, expected)
+    debug: Dict[str, Any] = {"imageWidth": W, "imageHeight": H, "triedCombos": tried}
+    if getattr(settings, "DEBUG_OCR", False) and cands:
+        top = sorted(cands, key=lambda x: (len(x[0]), x[1]), reverse=True)[:5]
+        debug["topCandidates"] = [{"digits": dd, "conf": round(cc, 3)} for dd, cc in top]
+    return d, float(c), debug
 
-    digits, conf = _best_digits_with_hint(candidates, expected)
-    debug: Dict[str, Any] = {
-        "imageWidth": W, "imageHeight": H,
-        "triedCombos": tried, "numCandidates": len(candidates)
-    }
-    if getattr(settings, "DEBUG_OCR", False):
-        top = sorted(candidates, key=lambda x: (len(x[0]), x[1]), reverse=True)[:5]
-        debug["topCandidates"] = [{"digits": d, "conf": round(c, 3)} for d, c in top]
-    return digits, float(conf), debug
+# ─────────────────────────────────────
+# 공개 API (라우터에서 사용)
+# ─────────────────────────────────────
+def ocr_jersey_image_bytes(image_bytes: bytes) -> Tuple[str, float]:
+    if not image_bytes:
+        return "", 0.0
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if bgr is None:
+        return "", 0.0
+    digits, conf, _ = _ocr_try_all(bgr)
+    return digits, conf
 
-
-# ✅ 힌트 지원 공개 API (라우터에서 backNumber 힌트 사용)
-def ocr_jersey_image_bytes_with_hint(image_bytes: bytes, expected: str | None) -> tuple[str, float]:
+def ocr_jersey_image_bytes_with_hint(image_bytes: bytes, expected: str | None) -> Tuple[str, float]:
     if not image_bytes:
         return "", 0.0
     arr = np.frombuffer(image_bytes, dtype=np.uint8)
@@ -350,149 +169,3 @@ def ocr_jersey_image_bytes_with_hint(image_bytes: bytes, expected: str | None) -
         return "", 0.0
     digits, conf, _ = _ocr_try_all(bgr, expected=expected)
     return digits, conf
-
-
-# ─────────────────────────────────────
-# 공개 OCR API
-# ─────────────────────────────────────
-def ocr_jersey_image_bytes(image_bytes: bytes) -> tuple[str, float]:
-    """
-    업로드된 등번호 '이미지'에서 숫자만 추출.
-    반환: (digits, conf) — conf는 0.0~1.0
-    (기존 라우터와의 호환을 위해 2-튜플 유지)
-    """
-    if not image_bytes:
-        return "", 0.0
-    arr = np.frombuffer(image_bytes, dtype=np.uint8)
-    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if bgr is None:
-        return "", 0.0
-
-    digits, conf, _dbg = _ocr_try_all(bgr)
-    return digits, conf
-
-
-def ocr_jersey_image_bytes_debug(image_bytes: bytes) -> tuple[str, float, Dict[str, Any]]:
-    """
-    디버그 정보까지 필요한 경우 사용.
-    반환: (digits, conf, debugDict)
-    """
-    if not image_bytes:
-        return "", 0.0, {"reason": "empty"}
-    arr = np.frombuffer(image_bytes, dtype=np.uint8)
-    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if bgr is None:
-        return "", 0.0, {"reason": "decode_failed"}
-    return _ocr_try_all(bgr)
-
-
-# ─────────────────────────────────────
-# time utils
-# ─────────────────────────────────────
-def _merge_times(times: list[float], max_gap: float) -> list[tuple[float, float]]:
-    """검출 시점들을 인접 간격(max_gap) 기준으로 [start,end] 구간으로 묶기."""
-    if not times:
-        return []
-    times = sorted(times)
-    segs: list[tuple[float, float]] = []
-    s = e = times[0]
-    for t in times[1:]:
-        if t - e <= max_gap:
-            e = t
-        else:
-            segs.append((s, e))
-            s = e = t
-    segs.append((s, e))
-    return segs
-
-
-def _expand_and_filter(
-    segs: list[tuple[float, float]],
-    pad: float,
-    min_dur: float,
-    total: float,
-) -> list[tuple[float, float]]:
-    """구간 앞뒤 pad 확장 후, 너무 짧은 구간 제거 + [0,total] 범위 클램프."""
-    out: list[tuple[float, float]] = []
-    for s, e in segs:
-        s2 = max(0.0, s - pad)
-        e2 = min(total, e + pad)
-        if e2 - s2 >= min_dur:
-            out.append((s2, e2))
-    return out
-
-
-# ─────────────────────────────────────
-# main API: 세그먼트 검출
-# ─────────────────────────────────────
-def detect_player_segments(
-    video_path: Path, jersey_number: int
-) -> List[Tuple[float, float]]:
-    """
-    간단한 등번호 감지 파이프라인:
-      1) fps로 프레임 샘플링 (ffmpeg)  ← 하드웨어 가속 옵션 사용 가능
-      2) 숫자 후보 ROI 추출(OpenCV) → 강화된 Tesseract OCR(숫자만)
-      3) jersey_number와 일치하는 프레임의 시점들을 병합해 구간 반환
-    """
-    assert video_path.exists(), f"input not found: {video_path}"
-
-    fps = settings.JERSEY_SAMPLE_FPS
-    min_seg = settings.JERSEY_MIN_SEG_DUR
-    merge_gap = settings.JERSEY_MERGE_GAP
-    num_conf = settings.JERSEY_NUM_CONF
-
-    tmp_dir: Optional[Path] = None
-    try:
-        tmp_dir, frames = _sample_frames_to_dir(video_path, fps=fps)
-        total = get_duration(video_path)
-        target = str(jersey_number)
-
-        hit_times: list[float] = []
-        for t, img_path in frames:
-            img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
-            if img is None:
-                continue
-
-            # 후보 ROI들에 대해 빠른 경로로 OCR
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            rois = _digit_roi_candidates(gray)
-            found = False
-
-            # ROI 우선(속도): 각 ROI 2~3배 × 빠른 PSM 세트
-            fast_psms = settings.OCR_PSMS or [7, 6, 10]
-            for roi in rois:
-                for fx in (2.0, 3.0):
-                    roi_big = cv2.resize(roi, None, fx=fx, fy=fx, interpolation=cv2.INTER_LINEAR)
-                    for psm in fast_psms:
-                        digs, cf = _tess_digits_with_conf(roi_big, psm=psm)
-                        digs = re.sub(r"\D+", "", digs)
-                        if digs and target in digs and cf >= num_conf:
-                            found = True
-                            break
-                    if found:
-                        break
-                if found:
-                    break
-
-            # ROI에서 못 찾으면, 이미지 전체를 보조 탐색(예산 내)
-            if not found:
-                digits, cf, _ = _ocr_try_all(img, expected=target)
-                if digits and target in digits and cf >= num_conf:
-                    found = True
-
-            if found:
-                hit_times.append(t)
-
-        # 시점 → 구간 병합, 확장, 최소 길이 필터
-        segs = _merge_times(hit_times, max_gap=merge_gap)
-        segs = _expand_and_filter(segs, pad=0.5, min_dur=min_seg, total=total)
-        logger.info(f"[jersey.segs] jersey={jersey_number} hits={len(hit_times)} segments={len(segs)}")
-        return segs
-
-    finally:
-        # 임시 프레임 폴더 정리
-        if tmp_dir:
-            try:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            except Exception:
-                pass

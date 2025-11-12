@@ -1,0 +1,8 @@
+# ai_worker/requirements.txt (수정)
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+pydantic>=2.7.0
+redis>=5.0.0
+anyio>=4.4.0
+# 🌟 [추가] 메타데이터 추출에 필요한 라이브러리
+ffmpeg-python==0.2.0  # 버전은 프로젝트에 맞게 지정해주세요

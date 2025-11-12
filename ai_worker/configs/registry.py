@@ -1,3 +1,4 @@
+#ai_worker/configs/registry.py
 # 역할: 데모 3개 영상 자동식별 + 자를 구간(시작,끝,라벨)
 # 라벨: "2PT" | "3PT" | "FT"
 

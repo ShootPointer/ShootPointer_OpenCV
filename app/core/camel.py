@@ -1,3 +1,4 @@
+#app/core/camel.py
 def to_camel(s: str) -> str:
     # "jersey_number" -> "jerseyNumber"
     parts = s.split("_")
