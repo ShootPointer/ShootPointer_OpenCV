@@ -103,7 +103,7 @@ class Settings(BaseSettings):
 
     # ── 업로드/청크/암복호화 키 ─────────────────────────────────
     AES_GCM_SECRET: str = Field(
-        "Nrgq06U0uVhC4b8p5Tg1JIHk4mWBUEKxL0ZghS2JcBo=",
+        "36b82ad3a534b95842e1bf29e538352481e4e265815042b12f4660852d89701a",
         env="AES_GCM_SECRET"
     )
     PRE_SIGNED_SECRET: str = Field("", env="PRE_SIGNED_SECRET")
