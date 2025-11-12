@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import logging
 import base64
+import re
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Dict, Optional
 
 from fastapi import APIRouter, Depends, Form, HTTPException, BackgroundTasks
 
 from app.core.config import settings
 from app.core.crypto import AESGCMCrypto, DecryptedToken, get_crypto_service
-from app.services.file_manager import merge_chunks_and_cleanup  # 파일 I/O 및 진행률 알림 위임 (chunk_saved_progress 제거됨)
+from app.services.file_manager import merge_chunks_and_cleanup  # 병합 및 정리 담당
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -22,13 +23,18 @@ router = APIRouter()
 CryptoDep = Annotated[AESGCMCrypto, Depends(get_crypto_service)]
 
 # ─────────────────────────────────────────────────────────────
+# 업로드 컨텍스트: jobId별 최초 fileName을 락으로 고정
+# ─────────────────────────────────────────────────────────────
+UPLOAD_CTX: Dict[str, str] = {}
+
+# ─────────────────────────────────────────────────────────────
 # 유틸: Base64(any) 디코더
 # ─────────────────────────────────────────────────────────────
 def _b64_any_decode(s: str) -> bytes:
     """
     URL-safe / 표준 Base64 모두 수용. 필요 시 패딩 보정 후 디코드.
     """
-    s = s.strip()
+    s = (s or "").strip()
     if not s:
         return b""
     # data URL prefix 제거 대응
@@ -44,6 +50,44 @@ def _b64_any_decode(s: str) -> bytes:
     except Exception:
         return base64.b64decode(s + pad)
 
+# ─────────────────────────────────────────────────────────────
+# 파일명 정화 + 확장자 화이트리스트
+# ─────────────────────────────────────────────────────────────
+_ALLOWED_EXTS = {".mp4", ".mkv", ".mov", ".m4v"}
+
+def _sanitize_filename(name: str, max_len: int = 120) -> str:
+    """
+    - 경로 구분자 제거
+    - 허용 문자만 유지 (영문/숫자/._- 공백)
+    - 길이 제한
+    - 확장자 화이트리스트 검사
+    """
+    if not name:
+        raise HTTPException(status_code=400, detail="invalid_filename: empty")
+
+    # 경로 구분자 제거
+    name = name.replace("\\", "/").split("/")[-1]
+
+    # 허용 문자만 남김 (한글 허용 필요 시 [^A-Za-z0-9._\\- ㄱ-힣] 등으로 확장)
+    name = re.sub(r'[^A-Za-z0-9._\- ]', '_', name).strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="invalid_filename: sanitized_to_empty")
+
+    # 너무 긴 이름 컷
+    if len(name) > max_len:
+        base, dot, ext = name.rpartition(".")
+        if dot:
+            base = base[: max(1, max_len - len(ext) - 1)]
+            name = f"{base}.{ext}"
+        else:
+            name = name[:max_len]
+
+    # 확장자 체크
+    ext = ("." + name.rsplit(".", 1)[-1].lower()) if "." in name else ""
+    if ext not in _ALLOWED_EXTS:
+        raise HTTPException(status_code=400, detail="invalid_extension: only video files are allowed")
+
+    return name
 
 # ─────────────────────────────────────────────────────────────
 # 내부 래퍼: file_manager 시그니처(4/5인자) 모두 호환
@@ -67,14 +111,13 @@ async def _merge_task_wrapper(
         # 기존 4인자 시그니처와의 호환 유지
         return await merge_chunks_and_cleanup(job_id, file_name, total_parts, chunk_dir)  # type: ignore
 
-
 # ─────────────────────────────────────────────────────────────
-# 엔드포인트
+# 엔드포인트: 청크 업로드
 # ─────────────────────────────────────────────────────────────
 @router.post("/chunk")
 async def upload_presigned_chunk(
     crypto: CryptoDep,
-    # file은 Base64 문자열로 받음
+    # 파일은 Base64 문자열로 받음
     file: str = Form(..., description="Base64 인코딩된 청크 문자열"),
     chunkIndex: int = Form(..., ge=1, description="현재 청크 번호 (1부터 시작)"),
     totalParts: int = Form(..., ge=1, description="전체 청크 개수"),
@@ -82,69 +125,70 @@ async def upload_presigned_chunk(
     fileName: str = Form(..., description="클라이언트가 업로드하는 파일명"),
 ):
     """
-    클라이언트로부터 Base64 인코딩된 청크를 받아 디코딩 및 저장
+    클라이언트로부터 Base64 인코딩된 청크를 받아 디코딩 및 저장.
+    - 토큰은 expires/memberId/jobId 인증만 수행 (fileName 비교 제거)
+    - fileName은 폼에서 받고 sanitize + 확장자 체크 + jobId 단위로 락
     """
-    job_id: str | None = None
-    token_file_name: str | None = None
+    job_id: Optional[str] = None
 
     try:
-        # 0) 유효성 검사 추가 (FastAPI가 처리하지 못하는 비즈니스 로직)
+        # 0) 유효성 검사
         if chunkIndex > totalParts:
             raise HTTPException(status_code=400, detail="chunkIndex cannot be greater than totalParts.")
 
-        # 1) 토큰 복호화/검증
+        # 1) 토큰 복호화/검증 → jobId, memberId 확인 (fileName 비교는 하지 않음)
         try:
             token_data: DecryptedToken = crypto.decrypt_token(presignedToken)
             job_id = token_data.jobId
-            token_file_name = token_data.fileName
+            member_id = token_data.memberId  # 로그/추적용
         except ValueError as e:
             logger.error(f"Token validation failed (ValueError) / ERR-A: {e}")
-            # [오류 코드 적용] ERR-A: 토큰 복호화 실패/만료/변조 시 401
+            # ERR-A: 토큰 복호화 실패/만료/변조 시 401
             raise HTTPException(status_code=401, detail=f"ERR-A: Invalid or expired access token: {str(e)}")
 
-        # 2) fileName 일치 검증
-        if fileName != token_file_name:
-            logger.error(
-                f"Filename mismatch for Job {job_id} / ERR-B: Token expects '{token_file_name}', received '{fileName}'"
-            )
-            # [오류 코드 적용] ERR-B: 파일명 불일치 시 400
-            raise HTTPException(
-                status_code=400,
-                detail=f"ERR-B: Upload file name mismatch with token (Expected: '{token_file_name}', Received: '{fileName}')",
-            )
+        # 2) 파일명 sanitize + 확장자 체크, 그리고 최초 파일명 락
+        safe_name = _sanitize_filename(fileName)
+        prev_name = UPLOAD_CTX.get(job_id)
+        if prev_name is None:
+            UPLOAD_CTX[job_id] = safe_name
+        elif prev_name != safe_name:
+            logger.error(f"[upload_chunk] filename changed within the same job. jobId={job_id}, prev={prev_name}, got={safe_name}")
+            # ERR-B2: 동일 jobId에서 파일명 변경 시 거부
+            raise HTTPException(status_code=400, detail="ERR-B2: filename changed within the same upload job.")
 
-        # 3) Base64 데이터 디코딩
-        base64_str = file
+        # 3) Base64 디코딩
         try:
-            if not base64_str.strip():
+            if not file.strip():
                 raise ValueError("Empty base64 payload")
-
-            chunk_binary_data = _b64_any_decode(base64_str)
+            chunk_binary_data = _b64_any_decode(file)
         except Exception as e:
             logger.error(f"Base64 decoding failed for chunk {chunkIndex} (Job {job_id}) / ERR-C: {e}")
-            # [오류 코드 적용] ERR-C: Base64 디코딩 실패 또는 페이로드 비어있음 시 493
+            # ERR-C: Base64 디코딩 실패 또는 페이로드 비어있음 시 493
             raise HTTPException(status_code=493, detail="ERR-C: Invalid or empty Base64 chunk payload.")
 
         if not chunk_binary_data:
             logger.error(f"Decoded chunk is empty for chunk {chunkIndex} (Job {job_id}) / ERR-C")
-            # [오류 코드 적용] ERR-C: 디코딩 후 바이너리 데이터가 비어있음 시 493
+            # ERR-C: 디코딩 후 바이너리 데이터가 비어있음 시 493
             raise HTTPException(status_code=493, detail="ERR-C: Decoded chunk binary data is empty.")
 
-        # 4) 청크 저장 경로 설정 및 저장 (file_manager의 책임)
-        chunk_dir = Path(settings.TEMP_ROOT) / job_id
-        chunk_dir.mkdir(parents=True, exist_ok=True)
+        # 4) 저장 경로 구성 (경로 탈출 방지)
+        base_dir = Path(settings.TEMP_ROOT).resolve()
+        chunk_dir = (base_dir / job_id).resolve()
+        if base_dir not in chunk_dir.parents and chunk_dir != base_dir:
+            raise HTTPException(status_code=400, detail="invalid_path")
 
-        chunk_filename = f"{job_id}_{token_file_name}.{chunkIndex:04d}"
-        chunk_path = chunk_dir / chunk_filename
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        chunk_filename = f"{job_id}_{safe_name}.{chunkIndex:04d}"
+        chunk_path = (chunk_dir / chunk_filename).resolve()
+        if chunk_dir not in chunk_path.parents and chunk_path != chunk_dir:
+            raise HTTPException(status_code=400, detail="invalid_path")
 
         with chunk_path.open("wb") as buffer:
             buffer.write(chunk_binary_data)
 
-        logger.info(f"Chunk {chunkIndex}/{totalParts} saved for Job {job_id}")
+        logger.info(f"Chunk {chunkIndex}/{totalParts} saved for Job {job_id} (memberId={member_id})")
 
-        # 5) 파일 저장 성공 후, 진행률 통보 로직 제거 (병합 시에만 보고하도록 변경됨)
-        # chunk_saved_progress(job_id, chunkIndex, totalParts) # <--- 이 라인이 제거되었습니다.
-
+        # 진행률 Pub/Sub은 병합 시점에만 보고(요구 사항에 맞춰 유지)
         return {"message": "Chunk uploaded successfully", "jobId": job_id, "chunkIndex": chunkIndex}
 
     except HTTPException:
@@ -154,48 +198,68 @@ async def upload_presigned_chunk(
         # 처리되지 않은 모든 예외는 500
         raise HTTPException(status_code=500, detail="Internal server error during chunk upload")
 
-
+# ─────────────────────────────────────────────────────────────
+# 엔드포인트: 업로드 완료 → 병합/정리 백그라운드 실행
+# ─────────────────────────────────────────────────────────────
 @router.post("/complete")
 async def complete_presigned_upload(
     crypto: CryptoDep,
     background_tasks: BackgroundTasks,
     totalParts: int = Form(..., ge=1, description="전체 청크 개수"),
     presignedToken: str = Form(..., description="AES-GCM 복호화 가능한 토큰"),
+    # 토큰에서 fileName을 제거했으므로, 필요 시 프론트가 함께 보내줄 수 있도록 옵션화
+    fileName: Optional[str] = Form(None, description="(선택) 업로드 파일명 – 미보내면 서버가 첫 청크에서 잠근 이름을 사용"),
 ):
     """
-    청크 완료 확인 (무결성 검증) → 프론트엔드에 즉시 응답 → 백그라운드에서 병합 및 AI 트리거
+    청크 완료 확인 (무결성 검증) → 프론트엔드에 즉시 응답 → 백그라운드에서 병합 및 AI 트리거.
+    - fileName은 클라이언트가 보낼 수도 있고, 안 보내면 UPLOAD_CTX[jobId] 사용
     """
-    job_id: str | None = None
-    chunk_dir: Path | None = None
-    file_name: str | None = None
-    member_id: str | None = None
+    job_id: Optional[str] = None
+    chunk_dir: Optional[Path] = None
+    safe_name: Optional[str] = None
+    member_id: Optional[str] = None
 
     try:
         # 1) 토큰 복호화/검증
         try:
             token_data: DecryptedToken = crypto.decrypt_token(presignedToken)
             job_id = token_data.jobId
-            file_name = token_data.fileName
-            member_id = token_data.memberId  # ← A-1: memberId 추출
+            member_id = token_data.memberId
         except ValueError as e:
             logger.error(f"Token validation failed in /complete / ERR-A: {e}")
-            # [오류 코드 적용] ERR-A: 토큰 복호화 실패/만료/변조 시 401
+            # ERR-A: 토큰 복호화 실패/만료/변조 시 401
             raise HTTPException(status_code=401, detail=f"ERR-A: Invalid or expired access token: {str(e)}")
 
-        # 2) 임시 청크 폴더 확인
-        chunk_dir = Path(settings.TEMP_ROOT) / job_id
+        # 2) 파일명 결정 (폼 > 컨텍스트)
+        if fileName and fileName.strip():
+            safe_name = _sanitize_filename(fileName)
+            # 컨텍스트가 이미 있으면 동일한지 확인(일관성 유지)
+            prev_name = UPLOAD_CTX.get(job_id)
+            if prev_name and prev_name != safe_name:
+                # 사용자가 마지막에 다른 이름을 보내왔다면, 보안상 거부(업로드 중 이름 변경 방지)
+                raise HTTPException(status_code=400, detail="ERR-B2: filename changed within the same upload job.")
+            UPLOAD_CTX[job_id] = safe_name
+        else:
+            safe_name = UPLOAD_CTX.get(job_id)
+            if not safe_name:
+                raise HTTPException(status_code=400, detail="missing_filename")
+
+        # 3) 임시 청크 폴더 확인 + 경로 탈출 방지
+        base_dir = Path(settings.TEMP_ROOT).resolve()
+        chunk_dir = (base_dir / job_id).resolve()
         if not chunk_dir.exists():
             raise HTTPException(status_code=404, detail="Job ID not found or no chunks uploaded.")
+        if base_dir not in chunk_dir.parents and chunk_dir != base_dir:
+            raise HTTPException(status_code=400, detail="invalid_path")
 
-        # 3) 개수 검증 (무결성 검증)
-        chunk_files = sorted(chunk_dir.glob(f"{job_id}_{file_name}.*"))
+        # 4) 개수 검증 (무결성 검증)
+        chunk_files = sorted(chunk_dir.glob(f"{job_id}_{safe_name}.*"))
         actual_parts = len(chunk_files)
-
         if actual_parts != totalParts:
             logger.error(
                 f"Integrity check failed for Job {job_id} / ERR-D: Expected {totalParts} parts, found {actual_parts}."
             )
-            # [오류 코드 적용] ERR-D: 청크 개수 불일치 시 494
+            # ERR-D: 청크 개수 불일치 시 494
             raise HTTPException(
                 status_code=494,
                 detail=f"ERR-D: Incomplete upload: Expected {totalParts} chunks, but only {actual_parts} were received.",
@@ -203,19 +267,18 @@ async def complete_presigned_upload(
 
         logger.info(f"Integrity check SUCCESS for Job {job_id}. Found {actual_parts}/{totalParts} chunks.")
 
-        # 4) 백그라운드 작업 추가 (병합, 정리, AI 트리거)
-        #    - A-1: memberId를 래퍼에 함께 전달 (file_manager가 4인자여도 안전)
+        # 5) 백그라운드 작업 추가 (병합, 정리, AI 트리거)
         background_tasks.add_task(
             _merge_task_wrapper,
             job_id,
-            file_name,
+            safe_name,
             totalParts,
             chunk_dir,
             member_id or "",  # Not None 보장
         )
-        logger.info(f"Background merge/cleanup task added for Job {job_id} (memberId={member_id}).")
+        logger.info(f"Background merge/cleanup task added for Job {job_id} (memberId={member_id}, fileName={safe_name}).")
 
-        # 5) 클라이언트에게 즉시 성공 응답
+        # 6) 클라이언트에게 즉시 성공 응답
         return {"message": "Upload integrity verified, processing started in background.", "jobId": job_id}
 
     except HTTPException:
