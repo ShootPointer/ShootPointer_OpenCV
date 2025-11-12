@@ -1,153 +1,140 @@
-# app/core/crypto.py
+# app/core/config.py
 from __future__ import annotations
 
-import base64
-import binascii
-import time
-import logging
-import re
-from typing import NamedTuple
+import os
+from typing import List
 
-# PyCryptodome 사용 (pip install pycryptodome 필요)
-from Crypto.Cipher import AES
-from app.core.config import settings
+from pydantic import Field
 
-logger = logging.getLogger(__name__)
+# BaseSettings 호환성: v2(pydantic-settings) 우선, 없으면 v1로 폴백
+try:
+    from pydantic_settings import BaseSettings, SettingsConfigDict  # Pydantic v2 권장
+    _HAS_V2_SETTINGS = True
+except Exception:  # pragma: no cover
+    from pydantic import BaseSettings  # Pydantic v1 폴백
+    SettingsConfigDict = None
+    _HAS_V2_SETTINGS = False
 
-# GCM 고정 태그 길이
-TAG_LENGTH = 16
-# 표준 GCM Nonce/IV 길이(권장 12바이트)
-IV_LENGTH = 12
 
-# ─────────────────────────────────────────────────────────────
-# 데이터 모델
-# ─────────────────────────────────────────────────────────────
+def _getenv_bool(key: str, default: bool = False) -> bool:
+    """환경변수 불리언 파싱: '1','true','yes','y','on' → True (대소문자 무시)"""
+    val = os.getenv(key)
+    if val is None:
+        return default
+    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
 
-class DecryptedToken(NamedTuple):
-    expires: int
-    memberId: str
-    jobId: str
-    fileName: str
 
-# ─────────────────────────────────────────────────────────────
-# 헬퍼
-# ─────────────────────────────────────────────────────────────
-
-def _b64url_decode(data: str) -> bytes:
-    """Base64URL 디코딩 (패딩 자동 보정)"""
-    s = (data or "").strip()
-    pad = "=" * ((4 - (len(s) % 4)) % 4)
-    return base64.urlsafe_b64decode(s + pad)
-
-def _get_aes_key() -> bytes:
-    """
-    settings.AES_GCM_SECRET를 32바이트 키로 변환.
-    - 64글자 hex면 hex 디코드
-    - 아니면 base64/base64url로 디코드
-    """
-    raw = (getattr(settings, "AES_GCM_SECRET", "") or "").strip()
-    if not raw:
-        logger.error("AES_GCM_SECRET is missing in settings. AUTHENTICATION WILL FAIL.")
-        raise RuntimeError("Missing AES_GCM_SECRET configuration.")
-
-    # 64 hex → 32 bytes
-    if re.fullmatch(r"[0-9a-fA-F]{64}", raw):
+def _getenv_floats(key: str, default: str) -> List[float]:
+    """콤마 구분 float 리스트 파싱"""
+    raw = os.getenv(key, default)
+    out: List[float] = []
+    for s in raw.split(","):
+        s = s.strip()
+        if not s:
+            continue
         try:
-            key_bytes = bytes.fromhex(raw)
-            if len(key_bytes) != 32:
-                logger.error("Hex AES_GCM_SECRET does not decode to 32 bytes.")
-                raise ValueError("Invalid AES key length.")
-            return key_bytes
-        except Exception as e:
-            logger.error(f"Failed to hex-decode AES_GCM_SECRET: {e}")
-            raise ValueError("Invalid hex for AES_GCM_SECRET.")
-
-    # Base64 / URL-safe Base64
-    try:
-        pad = "=" * ((4 - (len(raw) % 4)) % 4)
-        try:
-            key_bytes = base64.urlsafe_b64decode(raw + pad)
-        except binascii.Error:
-            key_bytes = base64.b64decode(raw + pad)
-
-        if len(key_bytes) != 32:
-            logger.error("AES_GCM_SECRET is not 32 bytes (256 bits) long.")
-            raise ValueError("Invalid AES key length.")
-        return key_bytes
-    except Exception as e:
-        logger.error(f"Failed to decode AES_GCM_SECRET: {e}")
-        raise ValueError("Invalid format for AES_GCM_SECRET.")
-
-# ─────────────────────────────────────────────────────────────
-# 핵심 암호화 클래스
-# ─────────────────────────────────────────────────────────────
-
-class AESGCMCrypto:
-    """
-    AES-GCM 복호화 및 검증 서비스.
-    """
-    def __init__(self):
-        self._key = _get_aes_key()
-
-    def decrypt_token(self, presigned_token: str) -> DecryptedToken:
-        """
-        presigned_token(Base64URL) → [IV(12)] [Ciphertext] [Tag(16)] 분리 후
-        AES-GCM decrypt_and_verify로 복호화/검증.
-        평문 포맷: "expires:memberId:jobId:fileName"
-        """
-        # 1) 토큰 Base64URL 디코딩
-        try:
-            combined = _b64url_decode(presigned_token)
+            out.append(float(s))
         except Exception:
-            raise ValueError("Invalid Base64URL encoding of the presigned token")
+            pass
+    return out
 
-        # 2) 길이 검증 및 분리
-        if len(combined) < IV_LENGTH + TAG_LENGTH + 1:
-            # 최소 한 바이트 이상의 ciphertext가 있어야 함
-            raise ValueError("Token too short to contain IV, Ciphertext, and Tag.")
 
-        iv = combined[:IV_LENGTH]
-        tag = combined[-TAG_LENGTH:]
-        cipher_bytes = combined[IV_LENGTH:-TAG_LENGTH]
-
-        if len(iv) != IV_LENGTH:
-            raise ValueError("Invalid AES-GCM Nonce/IV length (must be 12 bytes)")
-
-        # 3) 복호화 + 무결성 검증
+def _getenv_ints(key: str, default: str) -> List[int]:
+    """콤마 구분 int 리스트 파싱"""
+    raw = os.getenv(key, default)
+    out: List[int] = []
+    for s in raw.split(","):
+        s = s.strip()
+        if not s:
+            continue
         try:
-            cipher = AES.new(self._key, AES.MODE_GCM, nonce=iv)
-            plaintext = cipher.decrypt_and_verify(cipher_bytes, tag)
-            message = plaintext.decode("utf-8")
-        except Exception as e:
-            logger.warning(f"AES-GCM verification failed (Integrity check error): {e}")
-            raise ValueError("Presigned signature verification failed (Integrity check error)")
-
-        # 4) 파싱
-        try:
-            parts = message.split(":", 3)
-            if len(parts) != 4:
-                logger.error(f"Invalid message format: {message}")
-                raise ValueError("Invalid message format in presigned token")
-            expires_str, member_id, job_id, file_name = parts
-            expires = int(expires_str)
+            out.append(int(s))
         except Exception:
-            raise ValueError("Invalid message content or format in presigned token")
+            pass
+    return out
 
-        # 5) 만료 확인
-        if expires < int(time.time()):
-            raise ValueError("Presigned expired")
 
-        return DecryptedToken(
-            expires=expires,
-            memberId=member_id,
-            jobId=job_id,
-            fileName=file_name,
+class Settings(BaseSettings):
+    # v2(pydantic-settings)면 model_config로 .env 지정, 아니면 v1 Config로 폴백
+    if _HAS_V2_SETTINGS:
+        model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    else:
+        class Config:
+            env_file = ".env"
+            extra = "ignore"
+
+    # ── 파일/정적 URL ─────────────────────────────────────────────
+    SAVE_ROOT: str = Field("/data/highlights", env="SAVE_ROOT")
+    STATIC_BASE_URL: str = Field("http://localhost:8000/static/highlights", env="STATIC_BASE_URL")
+
+    # ── 등번호/OCR 기본 파라미터 ─────────────────────────────────
+    JERSEY_NUM_CONF: float = Field(0.5, env="JERSEY_NUM_CONF")
+
+    # ── Tesseract 세부 튜닝 ─────────────────────────────────────
+    JERSEY_TESSERACT_PSM: str = Field("7", env="JERSEY_TESSERACT_PSM")
+    JERSEY_TESSERACT_OEM: str = Field("3", env="JERSEY_TESSERACT_OEM")
+    OCR_PSMS: List[int] = _getenv_ints("OCR_PSMS", os.getenv("JERSEY_TESSERACT_PSM", "7"))
+    OCR_SCALES: List[float] = _getenv_floats("OCR_SCALES", "1.5,2.0,3.0")
+    OCR_TRY_INVERT: bool = _getenv_bool("OCR_TRY_INVERT", True)
+    DEBUG_OCR: bool = _getenv_bool("DEBUG_OCR", True)
+    OCR_TIMEOUT_SEC: int = Field(30, env="OCR_TIMEOUT_SEC")
+    OCR_MAX_COMBOS: int = Field(120, env="OCR_MAX_COMBOS")
+    OCR_MAX_SEC: float = Field(8.0, env="OCR_MAX_SEC")
+    JERSEY_OCR_CONFIDENCE_THRESHOLD: float = Field(0.5, env="JERSEY_OCR_CONFIDENCE_THRESHOLD")
+
+    # ── 실행/로깅/안정화 ───────────────────────────────────────
+    LOG_LEVEL: str = Field("INFO", env="LOG_LEVEL")
+    REQUEST_LOG_BODY: bool = Field(False, env="REQUEST_LOG_BODY")
+    FFMPEG_TIMEOUT_SEC: int = Field(120, env="FFMPEG_TIMEOUT_SEC")
+    MAX_UPLOAD_BYTES: int = Field(209_715_200, env="MAX_UPLOAD_BYTES")
+    MAX_CLIPS: int = Field(10, env="MAX_CLIPS")
+
+    # ── CORS ───────────────────────────────────────────────────
+    ALLOW_ORIGINS: str = Field("*", env="ALLOW_ORIGINS")
+
+    # ── 백엔드 콜백/보안 ───────────────────────────────────────
+    BACKEND_SECRET: str = Field("", env="BACKEND_SECRET")
+    CALLBACK_CONNECT_TIMEOUT: float = Field(30.0, env="CALLBACK_CONNECT_TIMEOUT")
+    CALLBACK_READ_TIMEOUT: float = Field(60.0, env="CALLBACK_READ_TIMEOUT")
+    CALLBACK_WRITE_TIMEOUT: float = Field(60.0, env="CALLBACK_WRITE_TIMEOUT")
+
+    # ── 업로드/청크/암복호화 키 ─────────────────────────────────
+    AES_GCM_SECRET: str = Field("", env="AES_GCM_SECRET")
+    PRE_SIGNED_SECRET: str = Field("", env="PRE_SIGNED_SECRET")
+
+    # ── 업로드 디렉터리/임시경로/외부접근 URL ─────────────────────
+    PRESIGNED_EXPIRES_MIN: int = Field(30, env="PRESIGNED_EXPIRES_MIN")
+    UPLOAD_DIR: str = Field("/tmp/uploads", env="UPLOAD_DIR")
+    UPLOAD_CHUNK_MAX_MB: int = Field(0, env="UPLOAD_CHUNK_MAX_MB")
+    TEMP_ROOT: str = Field(default_factory=lambda: os.getenv("TEMP_ROOT", os.getenv("UPLOAD_DIR", "/tmp/uploads")))
+    CHUNK_STORAGE_ROOT: str = Field(
+        default_factory=lambda: os.getenv(
+            "CHUNK_STORAGE_ROOT",
+            os.path.join(os.getenv("TEMP_ROOT", os.getenv("UPLOAD_DIR", "/tmp/uploads")), "chunks"),
         )
+    )
+    EXTERNAL_BASE_URL: str = Field("http://fastapi-host:8000/files", env="EXTERNAL_BASE_URL")
 
-# ─────────────────────────────────────────────────────────────
-# FastAPI 의존성
-# ─────────────────────────────────────────────────────────────
+    # ── Redis ─────────────────────────────────────────────────
+    MEMBER_ID: str = Field("default_user_id", env="MEMBER_ID")
+    REDIS_URL: str = Field("redis://127.0.0.1:6379/0", env="REDIS_URL")
 
-def get_crypto_service() -> AESGCMCrypto:
-    """FastAPI Depends()에서 사용할 암호화 서비스 인스턴스."""
-    return AESGCMCrypto()
+    # 1) FastAPI -> AI Worker 작업큐(List)
+    REDIS_QUEUE_NAME: str = Field("opencv-ai-job-queue", env="REDIS_AI_JOB_QUEUE")
+    # 2) 업로드 진행률 Pub/Sub
+    REDIS_UPLOAD_PROGRESS_CHANNEL: str = Field("opencv-progress-upload", env="REDIS_UPLOAD_PROGRESS_CHANNEL")
+    # 3) 하이라이트 진행률 Pub/Sub
+    REDIS_HIGHLIGHT_PROGRESS_CHANNEL: str = Field("opencv-progress-highlight", env="REDIS_HIGHLIGHT_PROGRESS_CHANNEL")
+
+    PROGRESS_PUBLISH_INTERVAL_SEC: float = Field(5.0, env="PROGRESS_PUBLISH_INTERVAL_SEC")
+    PROGRESS_INTERVAL_SEC: float = Field(5.0, env="PROGRESS_INTERVAL_SEC")
+
+    # ── 결과 보고(KV/TTL/콜백) ─────────────────────────────────
+    PUBLISH_RESULT_AS_KV: bool = Field(True, env="PUBLISH_RESULT_AS_KV")
+    RESULT_KEY_PREFIX: str = Field("highlight-", env="RESULT_KEY_PREFIX")
+    RESULT_TTL_SECONDS: int = Field(86_400, env="RESULT_TTL_SECONDS")
+    RESULT_CALLBACK_BASE_URL: str = Field("", env="RESULT_CALLBACK_BASE_URL")
+    RESULT_CALLBACK_PATH_TEMPLATE: str = Field("{jobId}", env="RESULT_CALLBACK_PATH_TEMPLATE")
+
+
+settings = Settings()
