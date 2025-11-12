@@ -52,29 +52,34 @@ pipeline {
             }
         }
 
-        stage('Deploy FastAPI Container') {
-            steps {
-                dir("${WORKDIR}") {
-                    sh 'echo "🚀 Deploying FastAPI Container..."'
-                    script {
-                        def running = sh(script: "docker ps -q -f name=${COMPOSE_SERVICE}", returnStdout: true).trim()
+        stage('Deploy FastAPI & AI Worker Containers') {
+    steps {
+        dir("${WORKDIR}") {
+            sh 'echo "🚀 Deploying FastAPI + AI Worker Containers..."'
+            script {
+                def runningFastAPI = sh(script: "docker ps -q -f name=fast-api", returnStdout: true).trim()
+                def runningWorker = sh(script: "docker ps -q -f name=ai_worker_simulator", returnStdout: true).trim()
 
-                        if (running) {
-                            sh 'echo "🛑 Stopping and Removing Existing Container..."'
-                            sh "docker stop ${COMPOSE_SERVICE} || true"
-                            sh "docker rm -f ${COMPOSE_SERVICE} || true"
-                        }
-
-                        sh 'echo "🚀 Starting New FastAPI Container..."'
-                        sh "docker-compose up -d --build ${COMPOSE_SERVICE}"
-                    }
+                if (runningFastAPI) {
+                    sh "docker stop fast-api || true"
+                    sh "docker rm -f fast-api || true"
                 }
-            }
-            post {
-                success { sh 'echo "✅ Successfully Deployed FastAPI Container"' }
-                failure { sh 'echo "❌ Failed to Deploy FastAPI Container"' }
+
+                if (runningWorker) {
+                    sh "docker stop ai_worker_simulator || true"
+                    sh "docker rm -f ai_worker_simulator || true"
+                }
+
+                sh 'echo "🚀 Starting Both Services..."'
+                sh "docker-compose up -d --build fast-api ai_worker"
             }
         }
+    }
+    post {
+        success { sh 'echo "✅ Successfully Deployed FastAPI + AI Worker"' }
+        failure { sh 'echo "❌ Deployment Failed (check logs)"' }
+    }
+}
 
         stage('Clean Up Old Images') {
             steps {
