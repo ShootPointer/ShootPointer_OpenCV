@@ -102,7 +102,10 @@ class Settings(BaseSettings):
     CALLBACK_WRITE_TIMEOUT: float = Field(60.0, env="CALLBACK_WRITE_TIMEOUT")
 
     # ── 업로드/청크/암복호화 키 ─────────────────────────────────
-    AES_GCM_SECRET: str = Field("", env="AES_GCM_SECRET")
+    AES_GCM_SECRET: str = Field(
+        "Nrgq06U0uVhC4b8p5Tg1JIHk4mWBUEKxL0ZghS2JcBo=",
+        env="AES_GCM_SECRET"
+    )
     PRE_SIGNED_SECRET: str = Field("", env="PRE_SIGNED_SECRET")
 
     # ── 업로드 디렉터리/임시경로/외부접근 URL ─────────────────────

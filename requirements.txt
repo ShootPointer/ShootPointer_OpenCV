@@ -11,7 +11,7 @@ pydantic>=2.7.0
 python-dotenv>=1.0.1
 aiofiles>=23.2.1
 cryptography>=42.0.0
-pycryptodome>=3.20
+pycryptodome==3.20.0
 pydantic-settings>=2.5.0
 # optional:
 # hiredis>=2.3.2
