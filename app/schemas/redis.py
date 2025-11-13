@@ -55,4 +55,5 @@ class AITaskPayload(BaseModel):
     originalFilePath: str = Field(..., description="AI Worker가 접근해야 하는 원본 파일의 임시 저장 경로/URL")
     # 선택: 하이라이트 식별자(백엔드/리포팅에 활용). 없으면 워커는 무시 가능.
     highlightIdentifier: Optional[str] = Field(default=None, description="하이라이트 식별자(선택)")
+    highlightKey: Optional[str] = Field(default=None, description="원본 하나에서 생성된 하이라이트 묶음 식별자")
     # TODO: AI 작업의 종류, 파라미터 등 필요한 메타데이터 추가

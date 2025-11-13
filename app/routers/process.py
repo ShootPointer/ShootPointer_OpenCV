@@ -137,6 +137,7 @@ async def start_process(
         jobId=uploadId,
         memberId=memberId,
         originalFilePath=original_file_path,
+        highlightKey=highlightKey,   # ← 추가!
     )
 
     logger.info(
