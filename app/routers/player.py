@@ -146,10 +146,12 @@ async def send_img(
         conf_threshold = getattr(settings, "JERSEY_OCR_CONFIDENCE_THRESHOLD", 0.5)
         if conf < conf_threshold or not digits:
             return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                content={"status": "error", "step": "ocr_confidence_check",
-                         "message": f"인식 정확도({conf:.2f})가 낮습니다(임계값 {conf_threshold:.2f}).",
-                         "memberId": member_id},
+                status_code=200,
+                content={
+                    "status": 200,
+                    "success": False,
+                    "error": "사진인식이 어렵습니다. 사진을 다시 찍어주세요."
+                }
             )
 
         # 캐시 저장 + 기대값 비교
@@ -159,9 +161,12 @@ async def send_img(
             detected = int(_digits_only(digits) or "0")
         if detected == 0:
             return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                content={"status": "error", "step": "cache",
-                         "message": "유효하지 않은 등번호(0)입니다.", "memberId": member_id},
+               status_code=200,
+                content={
+                    "status": 200,
+                    "success": False,
+                    "error": "사진인식이 어렵습니다. 사진을 다시 찍어주세요."
+                }
             )
         JERSEY_CACHE[member_id] = detected
 
@@ -185,4 +190,9 @@ async def send_img(
 
     except Exception as e:
         logger.exception(f"[/send-img] failed at step={step}: {e}")
-        return JSONResponse(status_code=500, content={"status": "error", "step": step, "message": str(e)})
+        return JSONResponse(status_code=200,
+            content={
+                "status": 200,
+                "success": False,
+                "error": "사진 인식 중 오류가 발생했습니다."
+            })
