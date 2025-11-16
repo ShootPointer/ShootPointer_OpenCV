@@ -184,7 +184,7 @@ async def _trigger_ai_worker(job_id: str, final_file_path: Path, member_id: Opti
 
     # extra 필드(워커 모델에 없어도 무시되도록 JSON에만 포함)
     payload_dict = json.loads(ai_payload.model_dump_json())
-    payload_dict["highlightIdentifier"] = highlight_identifier  # 추가 메타
+    payload_dict["highlightKey"] = highlight_identifier  # 추가 메타
 
     try:
         push_count = await redis.rpush(

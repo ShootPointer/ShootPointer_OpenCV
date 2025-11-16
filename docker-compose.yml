@@ -30,12 +30,12 @@ services:
       OUTPUT_DIR: /data/highlights/processed
       PROGRESS_CHANNEL_PREFIX: opencv-progress-highlight
       REDIS_AI_JOB_QUEUE: opencv-ai-job-queue
-      PYTHONPATH: /app:/app/ai_worker  
+      PYTHONPATH: /app:/app/ai_worker 
     volumes:
       # 1. 원본 영상을 읽기 위한 경로 (이전 설정 그대로 유지됨)
-      - /mnt/highlights:/data/highlights   
+      - /mnt/highlights:/data/highlights 
       # 2. 최종 결과물(/data/highlights/processed)을 저장할 경로 (신규 추가)
-      - /home/videos/highlight:/data/highlights/processed  
+      - /home/videos/highlight:/data/highlights/processed
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: on-failure
