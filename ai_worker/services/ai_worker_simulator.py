@@ -213,7 +213,16 @@ async def process_task(task: AITaskPayload):
         await _report_progress(job_id, "VIDEO_LOAD_INIT", 5, highlight_id=highlight_id)
 
         if not os.path.exists(original_path):
-            logger.error(f"[{job_id}] Task FAILED: Original file not found at {original_path}")
+            try:
+                base_dir = os.path.dirname(original_path)
+                logger.error(f"[{job_id}] Task FAILED: Original file not found at {original_path}")
+                logger.error(f"[{job_id}] DEBUG: base_dir exists? {os.path.exists(base_dir)}")
+                logger.error(f"[{job_id}] DEBUG: /data/highlights exists? {os.path.exists('/data/highlights')}")
+                if os.path.exists('/data/highlights'):
+                     logger.error(f"[{job_id}] DEBUG: /data/highlights entries: {os.listdir('/data/highlights')}")
+            except Exception as debug_e:
+                logger.error(f"[{job_id}] DEBUG: error while listing /data/highlights: {debug_e}")
+
             raise FileNotFoundError(f"Original file not found: {original_path}")
 
         metadata = get_video_metadata(original_path)
