@@ -9,10 +9,11 @@ services:
     env_file:
       - .env
     environment:
+      # 서버 Redis(호스트)에 붙도록 설정
       REDIS_URL: redis://host.docker.internal:6379/0
     volumes:
       # FastAPI와 AI Worker가 원본 영상을 공유하는 NFS 경로
-      - /mnt/highlights:/data/highlights 
+      - /mnt/highlights:/data/highlights
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -24,23 +25,25 @@ services:
       context: ./ai_worker
       dockerfile: Dockerfile
     container_name: ai_worker_simulator
+    env_file:
+      - .env            # ✅ fast-api랑 같은 .env도 보게 추가
     environment:
       REDIS_URL: redis://host.docker.internal:6379/0
       SPRING_API_URL: http://host.docker.internal:8080/api/v1/jobs
       OUTPUT_DIR: /data/highlights/processed
       PROGRESS_CHANNEL_PREFIX: opencv-progress-highlight
       REDIS_AI_JOB_QUEUE: opencv-ai-job-queue
-      PYTHONPATH: /app:/app/ai_worker 
+      PYTHONPATH: /app:/app/ai_worker
     volumes:
-      # 1. 원본 영상을 읽기 위한 경로 (이전 설정 그대로 유지됨)
-      - /mnt/highlights:/data/highlights 
-      # 2. 최종 결과물(/data/highlights/processed)을 저장할 경로 (신규 추가)
+      # 1. 원본 영상을 읽기 위한 경로 (이전 설정 그대로 유지)
+      - /mnt/highlights:/data/highlights
+      # 2. 최종 결과물(/data/highlights/processed)을 저장할 경로
       - /home/videos/highlight:/data/highlights/processed
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: on-failure
     networks:
-      app-net: {} 
+      app-net: {}
 
 networks:
   app-net:

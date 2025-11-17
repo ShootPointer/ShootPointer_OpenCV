@@ -23,6 +23,9 @@ MAX_RETRIES = 5  # 5회 재시도 약속
 # docker-compose 에서 OUTPUT_DIR=/data/highlights/processed 로 주입됨
 OUTPUT_BASE_DIR = os.getenv("OUTPUT_DIR", "/data/highlights/processed")
 
+# (옵션) 호스트 기준 prefix. 혹시라도 풀 경로가 /home/videos/... 로 들어오는 경우 대비
+HIGHLIGHT_STRIP_PREFIX = os.getenv("HIGHLIGHT_STRIP_PREFIX", "/home/videos")
+
 # ─────────────────────────────────────────────────────────────
 # 2. 내부 유틸리티 함수
 # ─────────────────────────────────────────────────────────────
@@ -37,6 +40,46 @@ def _extract_score_from_label(label: str) -> Dict[str, int]:
         return {"twoPointCount": 1, "threePointCount": 0}
     # "FT" (자유투) 및 기타는 0, 0으로 처리
     return {"twoPointCount": 0, "threePointCount": 0}
+
+
+def _to_relative_highlight_path(full_path: str) -> str:
+    """
+    내부 파일 경로를 'highlight/...' 뒤에 붙일 상대 경로로 변환한다.
+
+    우선 순서:
+    1) 컨테이너 내부 OUTPUT_BASE_DIR 기준 상대 경로
+       예) /data/highlights/processed/{jobId}/file.mp4
+           → {jobId}/file.mp4
+    2) (옵션) 호스트 기준 HIGHLIGHT_STRIP_PREFIX=/home/videos 기준 상대 경로
+       예) /home/videos/highlight/{jobId}/file.mp4
+           → highlight/{jobId}/file.mp4
+    3) 둘 다 안 맞으면 파일명만 사용 (폴백)
+    """
+    try:
+        full_abs = os.path.abspath(full_path)
+    except Exception:
+        full_abs = full_path
+
+    # 1) OUTPUT_BASE_DIR 기준
+    try:
+        base_abs = os.path.abspath(OUTPUT_BASE_DIR)
+        if full_abs.startswith(base_abs):
+            rel = os.path.relpath(full_abs, base_abs)  # 예) {jobId}/file.mp4
+            return rel.replace("\\", "/").lstrip("/")
+    except Exception:
+        pass
+
+    # 2) /home/videos 기준 (혹시라도 그런 경로가 넘어온 경우)
+    try:
+        host_base_abs = os.path.abspath(HIGHLIGHT_STRIP_PREFIX)
+        if full_abs.startswith(host_base_abs):
+            rel = os.path.relpath(full_abs, host_base_abs)  # 예) highlight/{jobId}/file.mp4
+            return rel.replace("\\", "/").lstrip("/")
+    except Exception:
+        pass
+
+    # 3) 폴백: 파일명만
+    return os.path.basename(full_abs).replace("\\", "/")
 
 
 def _build_payload(
@@ -65,24 +108,21 @@ def _build_payload(
     highlight_urls_list: List[Dict[str, Any]] = []
 
     for item in output_files_with_segments:
-        # 실제 파일 경로(컨테이너 기준), 예:
-        # /data/highlights/processed/{jobId}/{jobId}_segment_01.mp4
+        # 실제 파일 경로(컨테이너 기준 or 호스트 기준)
         output_path = item["output_path"]
 
-        # OUTPUT_BASE_DIR 기준 상대 경로로 변환
-        #   → {jobId}/{jobId}_segment_01.mp4
-        try:
-            relative_path = os.path.relpath(output_path, OUTPUT_BASE_DIR)
-        except Exception:
-            # 혹시 기준 디렉토리가 안 맞으면 파일명만 사용 (폴백)
-            relative_path = os.path.basename(output_path)
+        # OUTPUT_BASE_DIR 또는 /home/videos 기준으로 상대 경로 변환
+        #   예)
+        #     /data/highlights/processed/{jobId}/{jobId}_segment_01.mp4
+        #       -> {jobId}/{jobId}_segment_01.mp4
+        #     /home/videos/highlight/{jobId}/{jobId}_segment_01.mp4
+        #       -> highlight/{jobId}/{jobId}_segment_01.mp4
+        relative_path = _to_relative_highlight_path(output_path)
 
-        # 윈도우/리눅스 섞일 때를 대비해서 슬래시 통일
-        relative_path = relative_path.replace("\\", "/")
-
-        # 스펙: "highlight/{relative_path}"
-        #   예) highlight/a1d1f806c8324d02/a1d1f806c8324d02_segment_01.mp4
-        relative_url = f"highlight/{relative_path}"
+        # 최종적으로 백엔드에 전달되는 값:
+        #   highlight/{relative_path}
+        # 예) highlight/a1d1f806c8324d02/a1d1f806c8324d02_segment_01.mp4
+        relative_url = f"highlight/{relative_path.lstrip('/')}"  # 앞 슬래시 방지
 
         segment_label = item["segment"].get("label", "UNKNOWN")
         score = _extract_score_from_label(segment_label)
