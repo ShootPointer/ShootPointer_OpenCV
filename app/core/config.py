@@ -124,7 +124,7 @@ class Settings(BaseSettings):
 
     # ── Redis ─────────────────────────────────────────────────
     MEMBER_ID: str = Field("default_user_id", env="MEMBER_ID")
-    REDIS_URL: str = Field("redis://127.0.0.1:6379/0", env="REDIS_URL")
+    REDIS_URL: str = Field("redis://localhost:6379", env="REDIS_URL")
 
     # 1) FastAPI -> AI Worker 작업큐(List)
     REDIS_QUEUE_NAME: str = Field("opencv-ai-job-queue", env="REDIS_AI_JOB_QUEUE")
