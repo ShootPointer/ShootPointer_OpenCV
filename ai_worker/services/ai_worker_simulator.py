@@ -240,10 +240,17 @@ async def process_task(task: AITaskPayload):
             logger.warning(f"[{job_id}] AI analysis completed successfully, but found no highlights to cut.")
         else:
             logger.info(f"[{job_id}] Starting video cutting for {len(highlight_segments)} segments.")
+
+            # ✅ jobId별 하위 폴더 생성: /data/highlights/processed/{jobId}
+            job_output_dir = os.path.join(settings.OUTPUT_DIR, job_id)
+            os.makedirs(job_output_dir, exist_ok=True)
+
             total_segments = len(highlight_segments)
             for i, segment in enumerate(highlight_segments):
+                # 파일 이름은 기존 패턴 유지 (jobId_segment_xx.mp4) → 다른 로직 영향 최소화
                 output_filename = f"{job_id}_segment_{i+1:02d}.mp4"
-                output_path = os.path.join(settings.OUTPUT_DIR, output_filename)
+                # ✅ 이제는 jobId 폴더 안에 저장
+                output_path = os.path.join(job_output_dir, output_filename)
 
                 _run_ffmpeg_cut(job_id, original_path, segment, output_path)
 
@@ -252,9 +259,6 @@ async def process_task(task: AITaskPayload):
                     "output_path": output_path,
                     "segment": segment
                 })
-
-                progress = 70 + (20 * (i + 1) / total_segments)
-                await _report_progress(job_id, "CUTTING_IN_PROGRESS", progress, highlight_id=highlight_id)
 
         # 5단계: 완료 보고 (HTTP 전송 + Pub/Sub)
         final_output_paths = [d["output_path"] for d in output_files_with_segments]
