@@ -94,7 +94,16 @@ def _find_matching_plan(metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def _run_ai_pipeline_simulation(job_id: str, original_path: str, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+async def _run_ai_pipeline_simulation(
+    job_id: str,
+    original_path: str,
+    metadata: Dict[str, Any],
+    highlight_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    기존 AI 파이프라인 시뮬레이션 로직은 그대로 두고,
+    분석 구간(15% → 70%) 동안 progress를 촘촘하게 보내도록 수정.
+    """
     start_time = time.time()
     try:
         logger.info(f"[{job_id}] [SIMU 1/5] Starting video decoding and AI pipeline initialization...")
@@ -120,15 +129,33 @@ async def _run_ai_pipeline_simulation(job_id: str, original_path: str, metadata:
         matching_plan = _find_matching_plan(metadata)
         if not matching_plan:
             analysis_time = (time.time() - start_time) + (metadata.get("duration_sec", 10.0) * 0.2)
-            logger.warning(f"[{job_id}] [SIMU 4/5] AI Analysis Completed in {analysis_time:.2f}s, but no highlights found. Metadata: {metadata}")
+            logger.warning(
+                f"[{job_id}] [SIMU 4/5] AI Analysis Completed in {analysis_time:.2f}s, "
+                f"but no highlights found. Metadata: {metadata}"
+            )
             return []
 
         logger.info(f"[{job_id}] [SIMU 4/5] AI Analysis Success! Found matching plan: {matching_plan['name']}")
         logger.info(f"[{job_id}] Starting Frame-by-Frame Inference (Time Consuming Process)...")
-        analysis_time_sim = metadata.get("duration_sec", 10.0) * 0.7
-        await asyncio.sleep(analysis_time_sim)
 
-        logger.info(f"[{job_id}] [SIMU 5/5] Inference finished in {analysis_time_sim:.2f}s. {len(matching_plan['segments'])} segments identified.")
+        # --- 여기서부터가 실제 '긴 분석 구간' 시뮬레이션 ---
+        analysis_time_sim = metadata.get("duration_sec", 10.0) * 0.7
+
+        # highlight_id가 있는 경우에만 세분화된 진행률 전송
+        if highlight_id:
+            steps = 50  # B안: 적당한 단계 수
+            for step in range(steps):
+                await asyncio.sleep(analysis_time_sim / steps)
+                smooth_progress = 15 + ((step + 1) / steps * (70 - 15))  # 15% → 70%
+                await _report_progress(job_id, "ANALYZING", smooth_progress, highlight_id=highlight_id)
+        else:
+            # 안전장치: 혹시 highlight_id가 비어있으면 기존처럼 한 번에 sleep
+            await asyncio.sleep(analysis_time_sim)
+
+        logger.info(
+            f"[{job_id}] [SIMU 5/5] Inference finished in {analysis_time_sim:.2f}s. "
+            f"{len(matching_plan['segments'])} segments identified."
+        )
         return matching_plan["segments"]
 
     except Exception as e:
@@ -207,6 +234,7 @@ async def process_task(task: AITaskPayload):
             f"File: {original_path} | highlightIdentifier={highlight_id}"
         )
 
+        # 1% / 5% / 15% 구간은 기존 그대로 유지
         await _report_progress(job_id, "JOB_RECEIVED_INIT", 1, highlight_id=highlight_id)
         logger.info(f"[{job_id}] Simulating initial video file load and decoding setup (1.0s delay)...")
         await asyncio.sleep(1.0)
@@ -232,7 +260,15 @@ async def process_task(task: AITaskPayload):
         )
         await _report_progress(job_id, "METADATA_EXTRACTED", 15, highlight_id=highlight_id)
 
-        highlight_segments = await _run_ai_pipeline_simulation(job_id, original_path, metadata)
+        # 🔹 분석 파트(15→70)는 함수 내부에서 세분화해서 progress 전송
+        highlight_segments = await _run_ai_pipeline_simulation(
+            job_id,
+            original_path,
+            metadata,
+            highlight_id=highlight_id,
+        )
+
+        # 🔹 마지막에 기존과 동일하게 70% 지점 한 번 더 찍어서 호환성 유지
         await _report_progress(job_id, "ANALYSIS_FINISHED", 70, highlight_id=highlight_id)
 
         # 4단계: 하이라이트 컷팅
@@ -259,6 +295,10 @@ async def process_task(task: AITaskPayload):
                     "output_path": output_path,
                     "segment": segment
                 })
+
+                # 🔹 컷팅 구간 progress: 70% → 99% 사이를 세그먼트 개수 기준으로 분배
+                cut_progress = 70 + ((i + 1) / total_segments * (99 - 70))
+                await _report_progress(job_id, "CUTTING", cut_progress, highlight_id=highlight_id)
 
         # 5단계: 완료 보고 (HTTP 전송 + Pub/Sub)
         final_output_paths = [d["output_path"] for d in output_files_with_segments]

@@ -12,7 +12,11 @@ from fastapi import APIRouter, Depends, Form, HTTPException, BackgroundTasks
 
 from app.core.config import settings
 from app.core.crypto import AESGCMCrypto, DecryptedToken, get_crypto_service
-from app.services.file_manager import merge_chunks_and_cleanup  # 병합 및 정리 담당
+from app.services.file_manager import (
+    merge_chunks_and_cleanup,
+    report_progress_to_spring,  # ✅ 진행률 보고 함수 사용
+)
+from app.schemas.redis import UploadStatus  # ✅ 상태 Enum (UPLOADING 등)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -152,7 +156,10 @@ async def upload_presigned_chunk(
         if prev_name is None:
             UPLOAD_CTX[job_id] = safe_name
         elif prev_name != safe_name:
-            logger.error(f"[upload_chunk] filename changed within the same job. jobId={job_id}, prev={prev_name}, got={safe_name}")
+            logger.error(
+                f"[upload_chunk] filename changed within the same job. "
+                f"jobId={job_id}, prev={prev_name}, got={safe_name}"
+            )
             # ERR-B2: 동일 jobId에서 파일명 변경 시 거부
             raise HTTPException(status_code=400, detail="ERR-B2: filename changed within the same upload job.")
 
@@ -188,7 +195,30 @@ async def upload_presigned_chunk(
 
         logger.info(f"Chunk {chunkIndex}/{totalParts} saved for Job {job_id} (memberId={member_id})")
 
-        # 진행률 Pub/Sub은 병합 시점에만 보고(요구 사항에 맞춰 유지)
+        # ✅ 청크 업로드 진행률 보고 (0 ~ 90%)
+        try:
+            # 전체 업로드에서 청크 업로드 단계는 0~90% 구간 사용
+            upload_ratio = chunkIndex / totalParts  # 0.0 ~ 1.0
+            progress_int = int(round(upload_ratio * 90))  # 0 ~ 90 정수
+
+            # 0%로 남지 않도록 1%부터 시작, 최대 90%까지만
+            if progress_int < 1:
+                progress_int = 1
+            if progress_int > 90:
+                progress_int = 90
+
+            await report_progress_to_spring(
+                job_id,
+                UploadStatus.UPLOADING.value,  # "UPLOADING"
+                float(progress_int),
+            )
+        except Exception as e:
+            # 진행률 보고 실패해도 업로드 자체는 계속 되도록
+            logger.error(
+                f"Failed to report upload progress for chunk {chunkIndex}/{totalParts} of Job {job_id}: {e}"
+            )
+
+        # 기존 응답은 그대로 유지
         return {"message": "Chunk uploaded successfully", "jobId": job_id, "chunkIndex": chunkIndex}
 
     except HTTPException:
@@ -257,15 +287,29 @@ async def complete_presigned_upload(
         actual_parts = len(chunk_files)
         if actual_parts != totalParts:
             logger.error(
-                f"Integrity check failed for Job {job_id} / ERR-D: Expected {totalParts} parts, found {actual_parts}."
+                f"Integrity check failed for Job {job_id} / ERR-D: "
+                f"Expected {totalParts} parts, found {actual_parts}."
             )
             # ERR-D: 청크 개수 불일치 시 494
             raise HTTPException(
                 status_code=494,
-                detail=f"ERR-D: Incomplete upload: Expected {totalParts} chunks, but only {actual_parts} were received.",
+                detail=(
+                    "ERR-D: Incomplete upload: "
+                    f"Expected {totalParts} chunks, but only {actual_parts} were received."
+                ),
             )
 
         logger.info(f"Integrity check SUCCESS for Job {job_id}. Found {actual_parts}/{totalParts} chunks.")
+
+        # (선택) 여기서 90%로 정리하고 상태를 PROCESSING 으로 바꾸고 싶다면 아래 주석 해제:
+        # try:
+        #     await report_progress_to_spring(
+        #         job_id,
+        #         UploadStatus.PROCESSING.value,  # "PROCESSING"
+        #         90.0,
+        #     )
+        # except Exception as e:
+        #     logger.error(f"Failed to report PROCESSING(90%) for Job {job_id}: {e}")
 
         # 5) 백그라운드 작업 추가 (병합, 정리, AI 트리거)
         background_tasks.add_task(
@@ -276,7 +320,10 @@ async def complete_presigned_upload(
             chunk_dir,
             member_id or "",  # Not None 보장
         )
-        logger.info(f"Background merge/cleanup task added for Job {job_id} (memberId={member_id}, fileName={safe_name}).")
+        logger.info(
+            f"Background merge/cleanup task added for Job {job_id} "
+            f"(memberId={member_id}, fileName={safe_name})."
+        )
 
         # 6) 클라이언트에게 즉시 성공 응답
         return {"message": "Upload integrity verified, processing started in background.", "jobId": job_id}

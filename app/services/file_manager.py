@@ -227,6 +227,7 @@ async def _trigger_ai_worker(job_id: str, final_file_path: Path, member_id: Opti
             f"Queue size: {push_count}"
         )
 
+        # AI 시작 대기 상태: 여기서는 그대로 100% (업로드 단계는 이미 끝난 상태)
         await report_progress_to_spring(job_id, UploadStatus.AI_START_PENDING.value, 100.0)
 
     except Exception as e:
@@ -249,6 +250,12 @@ async def merge_chunks_and_cleanup(
     - 청크를 임시 경로에 병합한 뒤
     - 공유 볼륨(SAVE_ROOT/{job_id}/{file_name})으로 이동
     - 완료 정보 Redis 보고 및 AI Worker 큐 트리거
+
+    🔹 청크 업로드 구간에서 이미 0~90% 진행률을 보고하고 있으므로,
+       이 함수에서는:
+       - 병합 완료 시 99% (PROCESSING)
+       - 최종 저장 완료 시 100% (UPLOAD_COMPLETE)
+       만 추가로 보고합니다.
     """
     # 최종 저장 디렉토리(SAVE_ROOT/{job_id})
     final_save_dir = Path(settings.SAVE_ROOT) / job_id
@@ -263,8 +270,8 @@ async def merge_chunks_and_cleanup(
     final_path: Optional[Path] = None
     calculated_checksum: Optional[str] = None
 
-    # 1) 상태 보고 시작
-    await report_progress_to_spring(job_id, "IN_PROGRESS", 0.0)
+    # ⚠️ 여기서는 더 이상 0% 초기화 호출을 하지 않음
+    #    (청크 업로드 단계에서 이미 0~90%를 보고하고 있음)
 
     try:
         # 2) 청크 파일 목록 정렬 및 검증
@@ -277,25 +284,44 @@ async def merge_chunks_and_cleanup(
 
         logger.info(f"Starting merge of {total_parts} chunks into {temp_merge_path}")
 
-        # 3) 임시 경로에 병합(진행률 0~90%)
+        # 3) 임시 경로에 병합
+        #    병합 중 세부 진행률은 별도로 보내지 않고,
+        #    전체 병합이 끝난 시점에 99%로 일괄 보고
         with temp_merge_path.open("wb") as outfile:
-            for i, chunk_file in enumerate(chunk_files):
+            for chunk_file in chunk_files:
                 with chunk_file.open("rb") as infile:
                     shutil.copyfileobj(infile, outfile)
-                merge_progress = (i + 1) / total_parts * 90.0
-                await report_progress_to_spring(job_id, "IN_PROGRESS", merge_progress)
 
         logger.info("Merge completed at temp location. Moving to final save dir and calculating checksum.")
 
-        # 3.5) 최종 경로로 이동
+        # 3.2) 병합 완료 시점: 99% 보고 (PROCESSING 상태)
+        try:
+            await report_progress_to_spring(
+                job_id,
+                UploadStatus.PROCESSING.value,  # "PROCESSING"
+                99.0,
+            )
+        except Exception as e:
+            logger.error(f"Failed to report 99% PROCESSING for Job {job_id}: {e}")
+
+        # 3.5) 최종 경로로 이동 (SAVE_ROOT/{jobId}/{file_name})
         shutil.move(str(temp_merge_path), str(final_save_path))
         final_path = final_save_path
 
-        # 4) 체크섬 계산 및 95% 보고(최종 경로 기준)
-        calculated_checksum = calculate_file_checksum(final_path)
-        await report_progress_to_spring(job_id, "IN_PROGRESS", 95.0)
+        # 4) 원본이 최종 SAVE_ROOT 경로에 저장된 시점: 100% 보고 (UPLOAD_COMPLETE 상태)
+        try:
+            await report_progress_to_spring(
+                job_id,
+                UploadStatus.UPLOAD_COMPLETE.value,  # "UPLOAD_COMPLETE"
+                100.0,
+            )
+        except Exception as e:
+            logger.error(f"Failed to report 100% UPLOAD_COMPLETE for Job {job_id}: {e}")
 
-        # 4.5) 하이라이트 식별자 생성 + 메타 저장
+        # 4.5) 체크섬 계산 (진행률에는 영향 없음)
+        calculated_checksum = calculate_file_checksum(final_path)
+
+        # 4.6) 하이라이트 식별자 생성 + 메타 저장
         highlight_identifier = str(uuid4())
         await _save_job_meta(
             job_id,
@@ -322,6 +348,7 @@ async def merge_chunks_and_cleanup(
             f"Critical error during merge/cleanup/trigger for Job {job_id}: {e}",
             exc_info=True
         )
+        # 에러 시 기존 문자열 상태 유지 ("FAILED") — 백엔드가 이 값에 맞춰있을 수 있어서 건드리지 않음
         await report_progress_to_spring(job_id, "FAILED", 0.0)
 
     finally:
