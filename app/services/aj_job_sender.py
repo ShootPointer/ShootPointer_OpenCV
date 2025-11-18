@@ -19,7 +19,7 @@ logger.setLevel(logging.INFO)
 
 class Settings(BaseModel):
     """Redis 접속 정보 및 Queue 이름을 정의합니다."""
-    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379") 
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://host.docker.internal:6379/0") 
     # AI 워커가 모니터링할 Queue 이름
     AI_QUEUE_NAME: str = os.getenv("REDIS_AI_JOB_QUEUE", "opencv-ai-job-queue") 
     

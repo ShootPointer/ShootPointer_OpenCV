@@ -53,6 +53,8 @@ def calculate_file_checksum(file_path: Path) -> str:
 async def report_progress_to_spring(job_id: str, status: str, progress: float):
     """
     Redis를 통해 Spring 서버에 작업 진행 상태를 업데이트합니다. (0%~99% 중간 보고용)
+    - key: job:{jobId}:status (스냅샷)
+    - channel: {REDIS_UPLOAD_PROGRESS_CHANNEL}:{jobId} (Pub/Sub)
     """
     try:
         redis: Redis = get_redis_client()
@@ -63,19 +65,33 @@ async def report_progress_to_spring(job_id: str, status: str, progress: float):
         logger.error(f"Unknown error getting Redis client for Job {job_id}: {e}")
         return
 
+    # 공통 페이로드 (SET / PUBLISH 둘 다 이걸 사용)
+    status_data = {
+        "jobId": job_id,
+        "status": status,
+        "progress": f"{progress:.2f}",
+        "timestamp": int(time.time()),
+    }
+
+    # 1) 스냅샷 저장 (기존 동작 유지)
     try:
-        status_data = {
-            "jobId": job_id,
-            "status": status,
-            "progress": f"{progress:.2f}",
-            "timestamp": int(time.time())
-        }
         await redis.set(get_status_key(job_id), json.dumps(status_data), ex=3600)
         logger.info(f"Job {job_id} status updated: {status} ({progress:.2f}%)")
     except RedisConnectionError as e:
         logger.error(f"Redis connection dropped or operation failed for Job {job_id}: {e}")
     except Exception as e:
         logger.error(f"Failed to report status to Redis for Job {job_id}: {e}")
+
+    # 2) Pub/Sub 채널로도 발행 (백엔드가 SUBSCRIBE 하는 용도)
+    try:
+        channel = f"{settings.REDIS_UPLOAD_PROGRESS_CHANNEL}:{job_id}"
+        await redis.publish(channel, json.dumps(status_data))
+        logger.info(
+            f"Job {job_id} progress PUBLISHED to {channel}: "
+            f"{status} ({progress:.2f}%)"
+        )
+    except Exception as e:
+        logger.error(f"Failed to publish progress for Job {job_id} to channel: {e}")
 
 async def report_final_completion_to_spring(
     job_id: str,
@@ -85,6 +101,8 @@ async def report_final_completion_to_spring(
 ):
     """
     최종 완료된 원본 영상 정보를 Spring 서버에 약속된 JSON 형식으로 Redis를 통해 보고합니다.
+    - key: job:{jobId}:status (스냅샷)
+    - channel: {REDIS_UPLOAD_PROGRESS_CHANNEL}:{jobId} (Pub/Sub)
     """
     try:
         redis: Redis = get_redis_client()
@@ -127,17 +145,30 @@ async def report_final_completion_to_spring(
             "sizeBytes": file_size_bytes,
             "sourceUrl": source_url,
             "checksum": checksum,
-            "durationSec": duration_sec
+            "durationSec": duration_sec,
         },
         "message": "Original video successfully merged and stored.",
-        "timestamp": int(time.time() * 1000)
+        "timestamp": int(time.time() * 1000),
     }
 
+    # 1) 스냅샷 저장 (기존 동작 유지)
     try:
         await redis.set(get_status_key(job_id), json.dumps(payload), ex=3600)
         logger.info(f"Final completion JSON reported to Redis for Job {job_id}.")
     except Exception as e:
         logger.error(f"Failed to report final completion JSON to Redis for Job {job_id}: {e}")
+
+    # 2) Pub/Sub 채널로도 발행 (백엔드에서 SUBSCRIBE로 받는 용도)
+    try:
+        channel = f"{settings.REDIS_UPLOAD_PROGRESS_CHANNEL}:{job_id}"
+        await redis.publish(channel, json.dumps(payload))
+        logger.info(
+            f"Final completion JSON PUBLISHED to channel {channel} for Job {job_id}."
+        )
+    except Exception as e:
+        logger.error(
+            f"Failed to publish final completion JSON to channel for Job {job_id}: {e}"
+        )
 
 # ─────────────────────────────────────────────────────────────
 # 메타 저장 유틸
