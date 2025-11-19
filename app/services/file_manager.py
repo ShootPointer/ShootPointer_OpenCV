@@ -59,8 +59,8 @@ async def report_progress_to_spring(
     progress: Optional[float] = None,
     *,
     member_id: Optional[str] = None,
-    total_bytes: Optional[int] = None,
-    received_bytes: Optional[int] = None,
+    total_bytes: Optional[int] = None,      # ← 인자는 유지하지만
+    received_bytes: Optional[int] = None,   #    아래 payload 에서는 더 이상 사용하지 않음
     size_bytes: Optional[int] = None,
     checksum: Optional[str] = None,
     duration_sec: Optional[float] = None,
@@ -69,29 +69,54 @@ async def report_progress_to_spring(
     total_clips: Optional[int] = None,
 ) -> None:
     """
-    Spring ProgressData + ProgressType 규격에 맞춘 공통 보고 함수.
+    Spring ProgressData 최종 규격에 맞춘 공통 보고 함수.
 
-    Redis에 저장/발행되는 JSON 형식(최종 합의된 형태):
+    👉 Redis/PubSub 로 나가는 JSON 형식은 타입에 따라 아래와 같이 제한됨.
 
+    1) 청크 업로드 중 (UPLOADING)
     {
       "status": 200,
       "success": true,
       "timeStamp": 1731990000000,
-      "type": "UPLOADING" | "UPLOAD_COMPLETE" | "PROCESSING" | "COMPLETE",
-      "memberId": "...",
-      "jobId": "...",
-
-      // 타입에 따라 선택적으로 사용
+      "type": "UPLOADING",
       "progress": 32.5,
-      "totalBytes": 123456,
-      "receivedBytes": 32768,
-      "sizeBytes": 123456,
-      "checksum": "sha256:....",
-      "durationSec": 0.0,
-      "stage": "QUEUED" | "ANALYZING" | "CUTTING" ...,
-      "currentClip": 1,
-      "totalClips": 10
+      "jobId": "job1",
+      "memberId": "xxxx"
     }
+
+    2) 업로드/병합 완료 (UPLOAD_COMPLETE)
+    {
+      "status": 200,
+      "success": true,
+      "timeStamp": 1731990001000,
+      "type": "UPLOAD_COMPLETE",
+      "jobId": "job1",
+      "memberId": "xxxx"
+    }
+
+    3) AI 처리 중 (PROCESSING)
+    {
+      "status": 200,
+      "success": true,
+      "timeStamp": 1731990002000,
+      "type": "PROCESSING",
+      "progress": 32.5,
+      "jobId": "job1",
+      "memberId": "xxxx"
+    }
+
+    4) AI 처리 완료 (COMPLETE)
+    {
+      "status": 200,
+      "success": true,
+      "timeStamp": 1731990003000,
+      "type": "COMPLETE",
+      "jobId": "job1",
+      "memberId": "xxxx"
+    }
+
+    🔹 그 외의 필드(totalBytes, sizeBytes, checksum, stage, currentClip, totalClips 등)는
+       백엔드 스펙에 맞추기 위해 전송하지 않는다.
     """
     try:
         redis: Redis = get_redis_client()
@@ -102,50 +127,32 @@ async def report_progress_to_spring(
         logger.error(f"Unknown error getting Redis client for Job {job_id}: {e}")
         return
 
-    # 공통 필드 (Spring ProgressData + envelope)
+    # 타입 문자열 정규화
+    normalized_type = str(progress_type)
+
+    # 공통 필드 (항상 6개 고정)
     payload: Dict[str, Any] = {
         "status": 200,
         "success": True,
-        "timeStamp": int(time.time() * 1000),  # ms 단위
-        "type": progress_type,
-        "memberId": member_id or settings.MEMBER_ID,
-        "jobId": job_id,
+        "timeStamp": int(time.time() * 1000),          # ms 단위
+        "type": normalized_type,
+        "jobId": str(job_id),
+        "memberId": str(member_id or settings.MEMBER_ID),
     }
 
-    # 선택 필드들(해당 타입에 필요할 때만 채움)
-    if progress is not None:
+    # 🔹 progress 는 UPLOADING / PROCESSING 일 때만 포함
+    if normalized_type in ("UPLOADING", "PROCESSING") and progress is not None:
         payload["progress"] = float(progress)
 
-    if total_bytes is not None:
-        payload["totalBytes"] = int(total_bytes)
-
-    if received_bytes is not None:
-        payload["receivedBytes"] = int(received_bytes)
-
-    if size_bytes is not None:
-        payload["sizeBytes"] = int(size_bytes)
-
-    if checksum is not None:
-        payload["checksum"] = checksum
-
-    if duration_sec is not None:
-        payload["durationSec"] = float(duration_sec)
-
-    if stage is not None:
-        payload["stage"] = stage
-
-    if current_clip is not None:
-        payload["currentClip"] = int(current_clip)
-
-    if total_clips is not None:
-        payload["totalClips"] = int(total_clips)
+    # (나머지 totalBytes, sizeBytes, checksum, stage 등은
+    #  인자로만 받고 payload 에는 넣지 않는다.)
 
     # 1) 스냅샷 저장
     try:
         await redis.set(get_status_key(job_id), json.dumps(payload), ex=3600)
         logger.info(
-            f"Job {job_id} status updated: type={progress_type}, "
-            f"progress={payload.get('progress')}, stage={payload.get('stage')}"
+            f"Job {job_id} status updated: type={normalized_type}, "
+            f"progress={payload.get('progress')}"
         )
     except RedisConnectionError as e:
         logger.error(f"Redis connection dropped or operation failed for Job {job_id}: {e}")
@@ -158,7 +165,7 @@ async def report_progress_to_spring(
         await redis.publish(channel, json.dumps(payload))
         logger.info(
             f"Job {job_id} progress PUBLISHED to {channel}: "
-            f"type={progress_type}, progress={payload.get('progress')}, stage={payload.get('stage')}"
+            f"type={normalized_type}, progress={payload.get('progress')}"
         )
     except Exception as e:
         logger.error(f"Failed to publish progress for Job {job_id} to channel: {e}")
@@ -172,36 +179,32 @@ async def report_final_completion_to_spring(
 ) -> None:
     """
     UPLOAD_COMPLETE 단계(원본 영상 병합 + SAVE_ROOT에 최종 저장 완료)에 대한
-    최종 100% 진행 보고를 Spring 규격에 맞춰 전송.
+    최종 완료 보고.
 
-    → 내부적으로 report_progress_to_spring(type="UPLOAD_COMPLETE", progress=100.0, sizeBytes, checksum, durationSec) 호출.
+    👉 최종적으로는 type="UPLOAD_COMPLETE", progress 없이
+       {status, success, timeStamp, type, jobId, memberId} 만 전송된다.
     """
     try:
-        file_size_bytes = final_file_path.stat().st_size
+        # 지금은 사이즈/길이/체크섬을 Redis payload 로 보내지 않는다 (스펙 최소화)
+        _ = final_file_path.stat().st_size  # 필요하면 로컬 로그 정도로만 활용 가능
         member_id = member_id_override or settings.MEMBER_ID
-        duration_sec = 0.0  # TODO: ffprobe 결과로 실제 영상 길이 넣고 싶으면 여기서 교체
     except Exception as e:
         logger.error(f"Failed to get file stats for final notification: {e}")
-        file_size_bytes = 0
         member_id = member_id_override or settings.MEMBER_ID
-        duration_sec = 0.0
 
-    # UploadStatus에 UPLOAD_COMPLETE가 정의돼 있으면 그 값을 쓰고,
-    # 혹시 없으면 문자열 리터럴로 폴백
+    # UploadStatus 에 UPLOAD_COMPLETE 가 있으면 그 값을 사용, 없으면 문자열 사용
     try:
         progress_type = UploadStatus.UPLOAD_COMPLETE.value  # type: ignore[attr-defined]
     except Exception:
         progress_type = "UPLOAD_COMPLETE"
 
     try:
+        # 🔹 UPLOAD_COMPLETE 에서는 progress 를 포함하지 않음
         await report_progress_to_spring(
             job_id,
             progress_type,
-            100.0,
+            None,
             member_id=member_id,
-            size_bytes=file_size_bytes,
-            checksum=checksum,
-            duration_sec=duration_sec,
         )
         logger.info(f"Final completion reported to Redis for Job {job_id}.")
     except Exception as e:
@@ -269,8 +272,7 @@ async def _trigger_ai_worker(
             f"Queue size: {push_count}"
         )
 
-        # 🔹 스펙에 맞춰: 하이라이트 생성 단계 시작 전,
-        #    type="PROCESSING", stage="QUEUED", progress=0 으로 한 번 보고
+        # 🔹 하이라이트 생성 단계 시작 전, type="PROCESSING", progress=0 으로 한 번 보고
         try:
             try:
                 processing_type = UploadStatus.PROCESSING.value  # type: ignore[attr-defined]
@@ -282,9 +284,6 @@ async def _trigger_ai_worker(
                 processing_type,
                 0.0,
                 member_id=(member_id or settings.MEMBER_ID),
-                stage="QUEUED",
-                current_clip=0,
-                total_clips=0,
             )
         except Exception as e:
             logger.error(f"Failed to report PROCESSING(QUEUED) for Job {job_id}: {e}")
@@ -292,7 +291,11 @@ async def _trigger_ai_worker(
     except Exception as e:
         logger.error(f"Failed to queue AI task for Job {job_id}: {e}")
         # 에러 시에는 기존 ERROR/FAILED 플로우와 호환되도록 문자열 사용
-        await report_progress_to_spring(job_id, UploadStatus.ERROR.value if hasattr(UploadStatus, "ERROR") else "FAILED", 0.0)
+        try:
+            error_type = UploadStatus.ERROR.value  # type: ignore[attr-defined]
+        except Exception:
+            error_type = "FAILED"
+        await report_progress_to_spring(job_id, error_type, None)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -314,8 +317,8 @@ async def merge_chunks_and_cleanup(
 
     🔹 청크 업로드 구간에서 이미 0~90% 진행률을 보고하고 있으므로,
        이 함수에서는:
-       - 병합 완료 시 99% (type=PROCESSING, stage="MERGE_COMPLETED")
-       - 최종 저장 완료 시 100% (type=UPLOAD_COMPLETE, sizeBytes/checksum/durationSec 포함)
+       - 병합 완료 시 PROCESSING 99% (여기서도 type=PROCESSING, progress 포함)
+       - 최종 저장 완료 시 UPLOAD_COMPLETE (progress 없이)
        만 추가로 보고.
     """
     # 최종 저장 디렉토리(SAVE_ROOT/{job_id})
@@ -331,12 +334,8 @@ async def merge_chunks_and_cleanup(
     final_path: Optional[Path] = None
     calculated_checksum: Optional[str] = None
 
-    # ⚠️ 여기서는 더 이상 0% 초기화 호출을 하지 않음
-    #    (청크 업로드 단계에서 이미 0~90%를 보고하고 있음)
-
     try:
         # 2) 청크 파일 목록 정렬 및 검증
-        #   - 업로드 라우터에서 '{job_id}_{file_name}.{part_index}' 형태로 저장했다고 가정
         chunk_files = sorted(chunk_dir.glob(f"{job_id}_{file_name}.*"))
         if len(chunk_files) != total_parts:
             raise Exception(
@@ -353,7 +352,7 @@ async def merge_chunks_and_cleanup(
 
         logger.info("Merge completed at temp location. Moving to final save dir and calculating checksum.")
 
-        # 3.2) 병합 완료 시점: 99% (PROCESSING, stage=MERGE_COMPLETED)
+        # 3.2) 병합 완료 시점: PROCESSING 99%
         try:
             try:
                 processing_type = UploadStatus.PROCESSING.value  # type: ignore[attr-defined]
@@ -365,9 +364,6 @@ async def merge_chunks_and_cleanup(
                 processing_type,
                 99.0,
                 member_id=(member_id or settings.MEMBER_ID),
-                stage="MERGE_COMPLETED",
-                current_clip=0,
-                total_clips=0,
             )
         except Exception as e:
             logger.error(f"Failed to report 99% PROCESSING for Job {job_id}: {e}")
@@ -376,10 +372,10 @@ async def merge_chunks_and_cleanup(
         shutil.move(str(temp_merge_path), str(final_save_path))
         final_path = final_save_path
 
-        # 4) 체크섬 계산
+        # 4) 체크섬 계산 (현재는 Redis payload 에 사용하지 않지만, 필요 시 로그/검증용)
         calculated_checksum = calculate_file_checksum(final_path)
 
-        # 5) 최종 완료 JSON 보고 (type=UPLOAD_COMPLETE, progress=100)
+        # 5) 최종 완료 JSON 보고 (type=UPLOAD_COMPLETE, progress 없음)
         await report_final_completion_to_spring(
             job_id,
             final_path,
@@ -395,8 +391,8 @@ async def merge_chunks_and_cleanup(
             f"Critical error during merge/cleanup/trigger for Job {job_id}: {e}",
             exc_info=True,
         )
-        # 에러 시 기존 문자열 상태 유지 ("FAILED") — ProgressType과는 별개로 에러 표현용
-        await report_progress_to_spring(job_id, "FAILED", 0.0)
+        # 에러 시 기존 문자열 상태 유지 ("FAILED")
+        await report_progress_to_spring(job_id, "FAILED", None)
     finally:
         # 7) 임시 청크 폴더 삭제
         try:

@@ -99,7 +99,7 @@ async def _publish_progress(job_id: str, payload: Dict[str, Any]) -> None:
         await redis.publish(channel_name, json.dumps(payload))
         logger.info(
             f"[{job_id}] Progress PUBLISHED to {channel_name}: "
-            f"type={payload.get('type')}, stage={payload.get('stage')}, progress={payload.get('progress')}"
+            f"type={payload.get('type')}, progress={payload.get('progress')}"
         )
     except Exception as e:
         logger.error(f"[{job_id}] Failed to PUBLISH progress via Pub/Sub: {e}")
@@ -116,23 +116,40 @@ async def _report_processing_stage(
 ) -> None:
     """
     ProgressType.PROCESSING 단계 보고.
-    Spring ProgressValidator 요구사항:
-      - type == PROCESSING 일 때 stage, currentClip, totalClips 모두 not null 이어야 함.
+
+    👉 최종 Redis/PubSub JSON 형식 (AI 처리 중):
+
+    {
+      "status": 200,
+      "success": true,
+      "timeStamp": 1731990002000,
+      "type": "PROCESSING",
+      "progress": 32.5,
+      "jobId": "job1",
+      "memberId": "xxxx"
+    }
+
+    stage / current_clip / total_clips / highlight_id 는
+    - 로그에만 사용하고
+    - Redis payload 에는 포함하지 않는다.
     """
     payload: Dict[str, Any] = {
         "status": 200,
         "success": True,
         "timeStamp": int(time.time() * 1000),
-        "type": "PROCESSING",        # ProgressType.PROCESSING
-        "memberId": member_id,
-        "jobId": job_id,
+        "type": "PROCESSING",
+        "memberId": str(member_id),
+        "jobId": str(job_id),
         "progress": float(round(progress, 2)),
-        "stage": stage,
-        "currentClip": int(current_clip),
-        "totalClips": int(total_clips),
     }
-    if highlight_id:
-        payload["highlightIdentifier"] = highlight_id
+
+    # 디버깅용 상세 로그 (Redis 로는 안 나감)
+    logger.info(
+        f"[{job_id}] PROCESSING stage={stage}, "
+        f"clip={current_clip}/{total_clips}, "
+        f"highlightIdentifier={highlight_id}, "
+        f"progress={payload['progress']}"
+    )
 
     await _publish_progress(job_id, payload)
 
@@ -147,25 +164,31 @@ async def _report_completion(
 ) -> None:
     """
     ProgressType.COMPLETE 단계 보고.
-    - COMPLETE 는 Validator 상에서 추가 필드 강제 없음.
-    - progress 는 100(성공) 또는 -1(실패)로 전달.
+
+    👉 최종 Redis/PubSub JSON 형식 (AI 처리 완료):
+
+    {
+      "status": 200,
+      "success": true,
+      "timeStamp": 1731990003000,
+      "type": "COMPLETE",
+      "jobId": "job1",
+      "memberId": "xxxx"
+    }
+
+    - COMPLETE 단계에서는 progress / stage / currentClip / totalClips 등은
+      전송하지 않는다.
     """
-    progress_value = 100.0 if success else -1.0
+    progress_value = 100.0 if success else -1.0  # 로그용
 
     payload: Dict[str, Any] = {
         "status": 200,
         "success": success,
         "timeStamp": int(time.time() * 1000),
-        "type": "COMPLETE",          # ProgressType.COMPLETE
-        "memberId": member_id,
-        "jobId": job_id,
-        "progress": float(progress_value),
-        # COMPLETE 에서는 stage/currentClip/totalClips 필수 아님 (옵션)
-        "currentClip": int(total_clips) if success and total_clips > 0 else 0,
-        "totalClips": int(total_clips),
+        "type": "COMPLETE",
+        "memberId": str(member_id),
+        "jobId": str(job_id),
     }
-    if highlight_id:
-        payload["highlightIdentifier"] = highlight_id
 
     await _publish_progress(job_id, payload)
 
@@ -173,7 +196,7 @@ async def _report_completion(
     status_str = "COMPLETED" if success else "FAILED"
     logger.info(
         f"[{job_id}] Final Status: {status_str} "
-        f"(success={success}, totalClips={total_clips})"
+        f"(success={success}, totalClips={total_clips}, progress={progress_value})"
         f"{' | highlightIdentifier='+highlight_id if highlight_id else ''}"
     )
     if output_paths:
