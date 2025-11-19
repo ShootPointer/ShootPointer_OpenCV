@@ -39,6 +39,7 @@ class Settings(BaseModel):
     AI_QUEUE_NAME: str = os.getenv("REDIS_AI_JOB_QUEUE", "opencv-ai-job-queue")
     SPRING_API_URL: str = os.getenv("SPRING_API_URL", "http://host.docker.internal:8080/api/v1/jobs")
     OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "/data/highlights/processed")
+    # FastAPI 쪽 REDIS_UPLOAD_PROGRESS_CHANNEL 과 같은 prefix 를 사용
     PROGRESS_CHANNEL_PREFIX: str = os.getenv("PROGRESS_CHANNEL_PREFIX", "opencv-progress-highlight")
 
 
@@ -70,7 +71,118 @@ class AITaskPayload(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────
-# 2. 핵심 로직: AI 시뮬레이션, FFmpeg, 보고 함수 (기존 로직 유지)
+# 2. 공통: 진행률/완료 보고 유틸 (Spring ProgressData 스펙 맞추기)
+# ─────────────────────────────────────────────────────────────
+
+def _get_status_key(job_id: str) -> str:
+    """FastAPI 쪽과 맞추기 위해 동일한 스냅샷 키 사용."""
+    return f"job:{job_id}:status"
+
+
+async def _publish_progress(job_id: str, payload: Dict[str, Any]) -> None:
+    """
+    - Redis SET (스냅샷)
+    - Redis PUBLISH (Pub/Sub)
+    둘 다 수행. FastAPI 쪽과 형태를 맞춘다.
+    """
+    redis = get_redis_client()
+    status_key = _get_status_key(job_id)
+    try:
+        # 스냅샷
+        await redis.set(status_key, json.dumps(payload), ex=3600)
+    except Exception as e:
+        logger.error(f"[{job_id}] Failed to SET progress snapshot: {e}")
+
+    try:
+        # Pub/Sub
+        channel_name = f"{settings.PROGRESS_CHANNEL_PREFIX}:{job_id}"
+        await redis.publish(channel_name, json.dumps(payload))
+        logger.info(
+            f"[{job_id}] Progress PUBLISHED to {channel_name}: "
+            f"type={payload.get('type')}, stage={payload.get('stage')}, progress={payload.get('progress')}"
+        )
+    except Exception as e:
+        logger.error(f"[{job_id}] Failed to PUBLISH progress via Pub/Sub: {e}")
+
+
+async def _report_processing_stage(
+    job_id: str,
+    member_id: str,
+    stage: str,
+    progress: float,
+    current_clip: int,
+    total_clips: int,
+    highlight_id: Optional[str] = None,
+) -> None:
+    """
+    ProgressType.PROCESSING 단계 보고.
+    Spring ProgressValidator 요구사항:
+      - type == PROCESSING 일 때 stage, currentClip, totalClips 모두 not null 이어야 함.
+    """
+    payload: Dict[str, Any] = {
+        "status": 200,
+        "success": True,
+        "timeStamp": int(time.time() * 1000),
+        "type": "PROCESSING",        # ProgressType.PROCESSING
+        "memberId": member_id,
+        "jobId": job_id,
+        "progress": float(round(progress, 2)),
+        "stage": stage,
+        "currentClip": int(current_clip),
+        "totalClips": int(total_clips),
+    }
+    if highlight_id:
+        payload["highlightIdentifier"] = highlight_id
+
+    await _publish_progress(job_id, payload)
+
+
+async def _report_completion(
+    job_id: str,
+    member_id: str,
+    success: bool,
+    total_clips: int,
+    highlight_id: Optional[str] = None,
+    output_paths: Optional[List[str]] = None,
+) -> None:
+    """
+    ProgressType.COMPLETE 단계 보고.
+    - COMPLETE 는 Validator 상에서 추가 필드 강제 없음.
+    - progress 는 100(성공) 또는 -1(실패)로 전달.
+    """
+    progress_value = 100.0 if success else -1.0
+
+    payload: Dict[str, Any] = {
+        "status": 200,
+        "success": success,
+        "timeStamp": int(time.time() * 1000),
+        "type": "COMPLETE",          # ProgressType.COMPLETE
+        "memberId": member_id,
+        "jobId": job_id,
+        "progress": float(progress_value),
+        # COMPLETE 에서는 stage/currentClip/totalClips 필수 아님 (옵션)
+        "currentClip": int(total_clips) if success and total_clips > 0 else 0,
+        "totalClips": int(total_clips),
+    }
+    if highlight_id:
+        payload["highlightIdentifier"] = highlight_id
+
+    await _publish_progress(job_id, payload)
+
+    # 로그는 기존 느낌 유지
+    status_str = "COMPLETED" if success else "FAILED"
+    logger.info(
+        f"[{job_id}] Final Status: {status_str} "
+        f"(success={success}, totalClips={total_clips})"
+        f"{' | highlightIdentifier='+highlight_id if highlight_id else ''}"
+    )
+    if output_paths:
+        logger.info(f"[{job_id}] Output files: {output_paths}")
+    logger.info(f"[{job_id}] (Simulated) Final report target: {settings.SPRING_API_URL}/complete")
+
+
+# ─────────────────────────────────────────────────────────────
+# 3. 핵심 로직: AI 시뮬레이션, FFmpeg (기능은 그대로)
 # ─────────────────────────────────────────────────────────────
 
 def _find_matching_plan(metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -86,10 +198,16 @@ def _find_matching_plan(metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         duration_diff = abs(input_duration - plan.get("duration_sec", 0.0))
         is_duration_match = duration_diff <= DURATION_TOLERANCE_SEC
 
-        is_resolution_match = (input_width == plan.get("width", 0) and input_height == plan.get("height", 0))
+        is_resolution_match = (
+            input_width == plan.get("width", 0)
+            and input_height == plan.get("height", 0)
+        )
 
         if is_size_match and is_duration_match and is_resolution_match:
-            segments = [{"start": s, "duration": d, "label": l} for s, d, l in plan["segments"]]
+            segments = [
+                {"start": s, "duration": d, "label": l}
+                for s, d, l in plan["segments"]
+            ]
             return {"name": f"Demo Plan {plan['id']}", "segments": segments}
     return None
 
@@ -98,18 +216,22 @@ async def _run_ai_pipeline_simulation(
     job_id: str,
     original_path: str,
     metadata: Dict[str, Any],
+    member_id: str,
     highlight_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     기존 AI 파이프라인 시뮬레이션 로직은 그대로 두고,
-    분석 구간(15% → 70%) 동안 progress를 촘촘하게 보내도록 수정.
+    분석 구간(15% → 70%) 동안 progress 를 촘촘하게 보내도록만 수정.
     """
     start_time = time.time()
     try:
         logger.info(f"[{job_id}] [SIMU 1/5] Starting video decoding and AI pipeline initialization...")
         cap = cv2.VideoCapture(original_path)
         if not cap.isOpened():
-            logger.error(f"[{job_id}] ERROR: Could not open video file for AI analysis simulation. Path: {original_path}")
+            logger.error(
+                f"[{job_id}] ERROR: Could not open video file for AI analysis simulation. "
+                f"Path: {original_path}"
+            )
             return []
         ret, frame = cap.read()
         cap.release()
@@ -141,15 +263,23 @@ async def _run_ai_pipeline_simulation(
         # --- 여기서부터가 실제 '긴 분석 구간' 시뮬레이션 ---
         analysis_time_sim = metadata.get("duration_sec", 10.0) * 0.7
 
-        # highlight_id가 있는 경우에만 세분화된 진행률 전송
+        # highlight_id 가 있는 경우에만 세분화된 진행률 전송
         if highlight_id:
             steps = 50  # B안: 적당한 단계 수
             for step in range(steps):
                 await asyncio.sleep(analysis_time_sim / steps)
                 smooth_progress = 15 + ((step + 1) / steps * (70 - 15))  # 15% → 70%
-                await _report_progress(job_id, "ANALYZING", smooth_progress, highlight_id=highlight_id)
+                await _report_processing_stage(
+                    job_id=job_id,
+                    member_id=member_id,
+                    stage="ANALYZING",
+                    progress=smooth_progress,
+                    current_clip=0,
+                    total_clips=0,
+                    highlight_id=highlight_id,
+                )
         else:
-            # 안전장치: 혹시 highlight_id가 비어있으면 기존처럼 한 번에 sleep
+            # 안전장치: 혹시 highlight_id 가 비어있으면 기존처럼 한 번에 sleep
             await asyncio.sleep(analysis_time_sim)
 
         logger.info(
@@ -164,64 +294,86 @@ async def _run_ai_pipeline_simulation(
 
 
 def _run_ffmpeg_cut(job_id: str, src_path: str, segment: Dict[str, Any], output_path: str) -> None:
+    """
+    하이라이트 클립을 생성할 때,
+    - 원본 코덱/해상도를 그대로 복사하던 기존 방식(-c copy)을 버리고
+    - 모바일/웹 플레이어 호환성이 높은 표준 H.264 + AAC + yuv420p 로 재인코딩.
+      (해상도는 가로 1280 고정, 세로는 비율 유지 & 짝수)
+    """
     start = max(0.0, float(segment["start"]))
     duration = max(0.1, float(segment["duration"]))
 
     cmd = [
-        "ffmpeg", "-y", "-ss", f"{start:.3f}", "-i", src_path,
-        "-t", f"{duration:.3f}", "-c", "copy",
-        "-avoid_negative_ts", "make_zero", output_path,
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{start:.3f}",
+        "-i",
+        src_path,
+        "-t",
+        f"{duration:.3f}",
+        # ▼ 재인코딩 설정 (모바일/Expo-AV/ExoPlayer 친화)
+        # 해상도: 가로 1280, 세로는 비율 유지 + 짝수(-2)
+        "-vf",
+        "scale=1280:-2",
+        # 비디오 코덱: H.264
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-profile:v",
+        "high",
+        "-pix_fmt",
+        "yuv420p",
+        # 오디오 코덱: AAC
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-ac",
+        "2",
+        # MP4 스트리밍/모바일 재생 친화 옵션
+        "-movflags",
+        "+faststart",
+        output_path,
     ]
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        logger.info(f"[{job_id}] Segment cut success: {output_path} ({segment['label']})")
+        result = subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        logger.info(f"[{job_id}] Segment cut & re-encoded successfully: {output_path} ({segment['label']})")
     except subprocess.CalledProcessError as e:
-        logger.error(f"[{job_id}] FFmpeg cutting failed: {e.stderr.decode()}")
+        logger.error(
+            f"[{job_id}] FFmpeg cutting/re-encoding failed.\n"
+            f"Command: {' '.join(cmd)}\n"
+            f"STDERR: {e.stderr.decode(errors='ignore')}"
+        )
         raise RuntimeError(f"FFmpeg cut failed for segment: {segment['label']}")
 
 
-async def _report_progress(job_id: str, status: str, progress: float, highlight_id: Optional[str] = None):
-    redis = get_redis_client()
-    try:
-        channel_name = f"{settings.PROGRESS_CHANNEL_PREFIX}:{job_id}"
-        payload = {"jobId": job_id, "status": status, "progress": round(progress, 2)}
-        if highlight_id:
-            payload["highlightIdentifier"] = highlight_id
-        await redis.publish(channel_name, json.dumps(payload))
-        logger.info(
-            f"[{job_id}] Progress published to {channel_name}: {status}, {progress:.1f}%"
-            f"{' | highlightIdentifier='+highlight_id if highlight_id else ''}"
-        )
-    except Exception as e:
-        logger.error(f"[{job_id}] Failed to report progress via Pub/Sub: {e}")
-
-
-async def _report_completion(job_id: str, success: bool, output_paths: List[str] = None, highlight_id: Optional[str] = None):
-    status = "COMPLETED" if success else "FAILED"
-    await _report_progress(job_id, status, 100.0 if success else -1.0, highlight_id=highlight_id)
-
-    payload = {
-        "jobId": job_id,
-        "status": status,
-        "resultFiles": output_paths or [],
-        "message": "AI analysis and video cutting finished." if success else "AI processing failed."
-    }
-    if highlight_id:
-        payload["highlightIdentifier"] = highlight_id
-
-    logger.info(f"[{job_id}] Final Status: {status}"
-                f"{' | highlightIdentifier='+highlight_id if highlight_id else ''}")
-    logger.info(f"[{job_id}] (Simulated) Final report target: {settings.SPRING_API_URL}/complete")
-
+# ─────────────────────────────────────────────────────────────
+# 4. Task 처리 로직 (기능 유지, 진행률만 새 스펙으로)
+# ─────────────────────────────────────────────────────────────
 
 async def process_task(task: AITaskPayload):
     job_id = task.jobId
+    member_id = task.memberId
     original_path = task.originalFilePath
     highlight_id = (task.highlightIdentifier or "").strip()
 
     if not highlight_id:
-        # 하이라이트 키 없으면 즉시 실패 (변경 없음)
-        await _report_completion(job_id, success=False, highlight_id=None)
+        # 하이라이트 키 없으면 즉시 실패
+        await _report_completion(
+            job_id=job_id,
+            member_id=member_id,
+            success=False,
+            total_clips=0,
+            highlight_id=None,
+            output_paths=[],
+        )
         logger.error(f"[{job_id}] Task FAILED: highlightKey/highlightIdentifier is missing in payload.")
         return
 
@@ -230,15 +382,34 @@ async def process_task(task: AITaskPayload):
 
     try:
         logger.info(
-            f"[{job_id}] Task Received and Starting for member {task.memberId}. "
+            f"[{job_id}] Task Received and Starting for member {member_id}. "
             f"File: {original_path} | highlightIdentifier={highlight_id}"
         )
 
-        # 1% / 5% / 15% 구간은 기존 그대로 유지
-        await _report_progress(job_id, "JOB_RECEIVED_INIT", 1, highlight_id=highlight_id)
+        # 1단계: 작업 수신 (1%)
+        await _report_processing_stage(
+            job_id=job_id,
+            member_id=member_id,
+            stage="JOB_RECEIVED_INIT",
+            progress=1.0,
+            current_clip=0,
+            total_clips=0,
+            highlight_id=highlight_id,
+        )
+
         logger.info(f"[{job_id}] Simulating initial video file load and decoding setup (1.0s delay)...")
         await asyncio.sleep(1.0)
-        await _report_progress(job_id, "VIDEO_LOAD_INIT", 5, highlight_id=highlight_id)
+
+        # 2단계: 비디오 로드 완료 (5%)
+        await _report_processing_stage(
+            job_id=job_id,
+            member_id=member_id,
+            stage="VIDEO_LOAD_INIT",
+            progress=5.0,
+            current_clip=0,
+            total_clips=0,
+            highlight_id=highlight_id,
+        )
 
         if not os.path.exists(original_path):
             try:
@@ -247,33 +418,53 @@ async def process_task(task: AITaskPayload):
                 logger.error(f"[{job_id}] DEBUG: base_dir exists? {os.path.exists(base_dir)}")
                 logger.error(f"[{job_id}] DEBUG: /data/highlights exists? {os.path.exists('/data/highlights')}")
                 if os.path.exists('/data/highlights'):
-                     logger.error(f"[{job_id}] DEBUG: /data/highlights entries: {os.listdir('/data/highlights')}")
+                    logger.error(f"[{job_id}] DEBUG: /data/highlights entries: {os.listdir('/data/highlights')}")
             except Exception as debug_e:
                 logger.error(f"[{job_id}] DEBUG: error while listing /data/highlights: {debug_e}")
 
             raise FileNotFoundError(f"Original file not found: {original_path}")
 
+        # 3단계: 메타데이터 추출 (15%)
         metadata = get_video_metadata(original_path)
         logger.info(
             f"[{job_id}] Metadata: Duration={metadata.get('duration_sec'):.2f}s, "
-            f"Size={metadata.get('size_bytes')}, Resolution={metadata.get('width')}x{metadata.get('height')}"
+            f"Size={metadata.get('size_bytes')}, "
+            f"Resolution={metadata.get('width')}x{metadata.get('height')}"
         )
-        await _report_progress(job_id, "METADATA_EXTRACTED", 15, highlight_id=highlight_id)
-
-        # 🔹 분석 파트(15→70)는 함수 내부에서 세분화해서 progress 전송
-        highlight_segments = await _run_ai_pipeline_simulation(
-            job_id,
-            original_path,
-            metadata,
+        await _report_processing_stage(
+            job_id=job_id,
+            member_id=member_id,
+            stage="METADATA_EXTRACTED",
+            progress=15.0,
+            current_clip=0,
+            total_clips=0,
             highlight_id=highlight_id,
         )
 
-        # 🔹 마지막에 기존과 동일하게 70% 지점 한 번 더 찍어서 호환성 유지
-        await _report_progress(job_id, "ANALYSIS_FINISHED", 70, highlight_id=highlight_id)
+        # 4단계: 분석 구간 (15 → 70% 구간은 내부에서 촘촘하게 보고)
+        highlight_segments = await _run_ai_pipeline_simulation(
+            job_id=job_id,
+            original_path=original_path,
+            metadata=metadata,
+            member_id=member_id,
+            highlight_id=highlight_id,
+        )
 
-        # 4단계: 하이라이트 컷팅
+        # 분석 최종 마무리 포인트 70% (기존 호환용)
+        await _report_processing_stage(
+            job_id=job_id,
+            member_id=member_id,
+            stage="ANALYSIS_FINISHED",
+            progress=70.0,
+            current_clip=0,
+            total_clips=0,
+            highlight_id=highlight_id,
+        )
+
+        # 5단계: 하이라이트 컷팅 (70 → 99%)
         if not highlight_segments:
             logger.warning(f"[{job_id}] AI analysis completed successfully, but found no highlights to cut.")
+            total_segments = 0
         else:
             logger.info(f"[{job_id}] Starting video cutting for {len(highlight_segments)} segments.")
 
@@ -283,63 +474,98 @@ async def process_task(task: AITaskPayload):
 
             total_segments = len(highlight_segments)
             for i, segment in enumerate(highlight_segments):
-                # 파일 이름은 기존 패턴 유지 (jobId_segment_xx.mp4) → 다른 로직 영향 최소화
+                # 파일 이름은 기존 패턴 유지 (jobId_segment_xx.mp4)
                 output_filename = f"{job_id}_segment_{i+1:02d}.mp4"
-                # ✅ 이제는 jobId 폴더 안에 저장
                 output_path = os.path.join(job_output_dir, output_filename)
 
                 _run_ffmpeg_cut(job_id, original_path, segment, output_path)
 
-                # 파일 경로와 세그먼트 정보를 묶어 저장 (spring_reporter로 전달)
-                output_files_with_segments.append({
-                    "output_path": output_path,
-                    "segment": segment
-                })
+                # 파일 경로와 세그먼트 정보를 묶어 저장 (spring_reporter 로 전달)
+                output_files_with_segments.append(
+                    {
+                        "output_path": output_path,
+                        "segment": segment,
+                    }
+                )
 
                 # 🔹 컷팅 구간 progress: 70% → 99% 사이를 세그먼트 개수 기준으로 분배
                 cut_progress = 70 + ((i + 1) / total_segments * (99 - 70))
-                await _report_progress(job_id, "CUTTING", cut_progress, highlight_id=highlight_id)
+                await _report_processing_stage(
+                    job_id=job_id,
+                    member_id=member_id,
+                    stage="CUTTING",
+                    progress=cut_progress,
+                    current_clip=i + 1,
+                    total_clips=total_segments,
+                    highlight_id=highlight_id,
+                )
 
-        # 5단계: 완료 보고 (HTTP 전송 + Pub/Sub)
+        # 6단계: 완료 보고 (HTTP 전송 + COMPLETE 이벤트)
         final_output_paths = [d["output_path"] for d in output_files_with_segments]
 
         if not output_files_with_segments:
-            # 하이라이트가 없으면 HTTP 전송 없이 Pub/Sub으로만 완료 보고
-            await _report_completion(job_id, success=True, highlight_id=highlight_id)
+            # 하이라이트가 없으면 HTTP 전송 없이 COMPLETE 만 보고
+            await _report_completion(
+                job_id=job_id,
+                member_id=member_id,
+                success=True,
+                total_clips=0,
+                highlight_id=highlight_id,
+                output_paths=[],
+            )
             final_message = "Task processing COMPLETE. No highlights found."
         else:
             # 하이라이트가 있으면 HTTP 전송 시도 (재시도 포함)
             http_success = await send_highlight_result_with_retry(
-                task.memberId,
+                job_id,                # ✅ jobId 바디에 넣기 위해 추가
+                member_id,
                 highlight_id,
-                output_files_with_segments
+                output_files_with_segments,
             )
 
-            # HTTP 전송 결과에 관계없이 Pub/Sub으로 최종 완료 상태 보고 (AI 작업 성공으로 간주)
+            # HTTP 전송 결과에 관계없이 COMPLETE 이벤트는 성공으로 간주
             await _report_completion(
-                job_id,
+                job_id=job_id,         # ✅ 파라미터 이름 정확히 job_id
+                member_id=member_id,
                 success=True,
+                total_clips=len(output_files_with_segments),
+                highlight_id=highlight_id,
                 output_paths=final_output_paths,
-                highlight_id=highlight_id
             )
 
             if http_success:
                 final_message = "Task processing COMPLETE and SUCCESSFULLY REPORTED to Spring."
             else:
-                final_message = f"Task processing COMPLETE but HTTP REPORTING FAILED after {MAX_RETRIES} retries."
+                final_message = (
+                    f"Task processing COMPLETE but HTTP REPORTING FAILED after {MAX_RETRIES} retries."
+                )
 
         logger.info(f"[{job_id}] {final_message}. Total output files: {len(output_files_with_segments)}")
 
     except FileNotFoundError:
-        await _report_completion(job_id, success=False, highlight_id=highlight_id)
+        await _report_completion(
+            job_id=job_id,
+            member_id=member_id,
+            success=False,
+            total_clips=0,
+            highlight_id=highlight_id,
+            output_paths=[],
+        )
         logger.error(f"[{job_id}] Task FAILED: Original file not found at {original_path}")
     except Exception as e:
-        await _report_completion(job_id, success=False, highlight_id=highlight_id)
+        await _report_completion(
+            job_id=job_id,
+            member_id=member_id,
+            success=False,
+            total_clips=0,
+            highlight_id=highlight_id,
+            output_paths=[],
+        )
         logger.error(f"[{job_id}] Task FAILED unexpectedly: {type(e).__name__}: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
-# 4. Main Worker 루프 (수신자/Consumer 로직)
+# 5. Main Worker 루프 (수신자/Consumer 로직)
 # ─────────────────────────────────────────────────────────────
 
 async def ai_worker_main():

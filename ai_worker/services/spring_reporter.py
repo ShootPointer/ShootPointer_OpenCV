@@ -83,6 +83,7 @@ def _to_relative_highlight_path(full_path: str) -> str:
 
 
 def _build_payload(
+    job_id: str,
     member_id: str,
     highlight_id: str,
     output_files_with_segments: List[Dict[str, Any]],
@@ -91,6 +92,7 @@ def _build_payload(
     스프링 API 명세에 맞는 JSON Payload를 구성합니다.
 
     {
+      "jobId": "...",
       "highlightIdentifier": "...",
       "highlightUrls": [
         {
@@ -136,9 +138,10 @@ def _build_payload(
         )
 
     return {
-        "highlightIdentifier": highlight_id,                 # ✅ 그대로 사용
+        "jobId": job_id,                                   # ✅ 추가: jobId 루트에 포함
+        "highlightIdentifier": highlight_id,               # ✅ 그대로 사용
         "highlightUrls": highlight_urls_list,
-        "createdAt": current_time_iso,                       # ✅ 루트에 createdAt 추가
+        "createdAt": current_time_iso,                     # ✅ 루트에 createdAt 추가
     }
 
 # ─────────────────────────────────────────────────────────────
@@ -146,13 +149,14 @@ def _build_payload(
 # ─────────────────────────────────────────────────────────────
 
 def _send_highlight_sync(
+    job_id: str,
     member_id: str,
     highlight_id: str,
     output_files_with_segments: List[Dict[str, Any]],
 ) -> bool:
     """실제 동기 HTTP POST 요청을 실행합니다."""
 
-    payload = _build_payload(member_id, highlight_id, output_files_with_segments)
+    payload = _build_payload(job_id, member_id, highlight_id, output_files_with_segments)
 
     headers = {
         "Content-Type": "application/json",
@@ -201,6 +205,7 @@ def _send_highlight_sync(
 # ─────────────────────────────────────────────────────────────
 
 async def send_highlight_result_with_retry(
+    job_id: str,
     member_id: str,
     highlight_id: str,
     output_files_with_segments: List[Dict[str, Any]],
@@ -210,6 +215,7 @@ async def send_highlight_result_with_retry(
     """
     return await asyncio.to_thread(
         _send_highlight_sync,
+        job_id,
         member_id,
         highlight_id,
         output_files_with_segments,

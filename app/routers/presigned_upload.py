@@ -1,5 +1,3 @@
-# app/routers/presigned_upload.py
-
 from __future__ import annotations
 
 import logging
@@ -73,7 +71,7 @@ def _sanitize_filename(name: str, max_len: int = 120) -> str:
     name = name.replace("\\", "/").split("/")[-1]
 
     # 허용 문자만 남김 (한글 허용 필요 시 [^A-Za-z0-9._\\- ㄱ-힣] 등으로 확장)
-    name = re.sub(r'[^A-Za-z0-9._\- ]', '_', name).strip()
+    name = re.sub(r"[^A-Za-z0-9._\- ]", "_", name).strip()
     if not name:
         raise HTTPException(status_code=400, detail="invalid_filename: sanitized_to_empty")
 
@@ -238,7 +236,10 @@ async def complete_presigned_upload(
     totalParts: int = Form(..., ge=1, description="전체 청크 개수"),
     presignedToken: str = Form(..., description="AES-GCM 복호화 가능한 토큰"),
     # 토큰에서 fileName을 제거했으므로, 필요 시 프론트가 함께 보내줄 수 있도록 옵션화
-    fileName: Optional[str] = Form(None, description="(선택) 업로드 파일명 – 미보내면 서버가 첫 청크에서 잠근 이름을 사용"),
+    fileName: Optional[str] = Form(
+        None,
+        description="(선택) 업로드 파일명 – 미보내면 서버가 첫 청크에서 잠근 이름을 사용",
+    ),
 ):
     """
     청크 완료 확인 (무결성 검증) → 프론트엔드에 즉시 응답 → 백그라운드에서 병합 및 AI 트리거.
@@ -300,16 +301,6 @@ async def complete_presigned_upload(
             )
 
         logger.info(f"Integrity check SUCCESS for Job {job_id}. Found {actual_parts}/{totalParts} chunks.")
-
-        # (선택) 여기서 90%로 정리하고 상태를 PROCESSING 으로 바꾸고 싶다면 아래 주석 해제:
-        # try:
-        #     await report_progress_to_spring(
-        #         job_id,
-        #         UploadStatus.PROCESSING.value,  # "PROCESSING"
-        #         90.0,
-        #     )
-        # except Exception as e:
-        #     logger.error(f"Failed to report PROCESSING(90%) for Job {job_id}: {e}")
 
         # 5) 백그라운드 작업 추가 (병합, 정리, AI 트리거)
         background_tasks.add_task(
