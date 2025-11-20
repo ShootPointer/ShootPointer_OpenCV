@@ -50,7 +50,7 @@ def calculate_file_checksum(file_path: Path) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# 진행률/완료 보고 로직 (Spring ProgressData 규격)
+# 진행률/완료/에러 보고 로직 (Spring ProgressData 규격)
 # ─────────────────────────────────────────────────────────────
 
 async def report_progress_to_spring(
@@ -59,6 +59,8 @@ async def report_progress_to_spring(
     progress: Optional[float] = None,
     *,
     member_id: Optional[str] = None,
+    success: bool = True,
+    message: Optional[str] = None,
     total_bytes: Optional[int] = None,      # ← 인자는 유지하지만
     received_bytes: Optional[int] = None,   #    아래 payload 에서는 더 이상 사용하지 않음
     size_bytes: Optional[int] = None,
@@ -115,6 +117,10 @@ async def report_progress_to_spring(
       "memberId": "xxxx"
     }
 
+    🔹 에러가 발생한 경우
+      - type 은 위 4개 중 하나를 사용
+      - 대신 success=false, message="에러 원인" 으로 전달
+
     🔹 그 외의 필드(totalBytes, sizeBytes, checksum, stage, currentClip, totalClips 등)는
        백엔드 스펙에 맞추기 위해 전송하지 않는다.
     """
@@ -130,10 +136,10 @@ async def report_progress_to_spring(
     # 타입 문자열 정규화
     normalized_type = str(progress_type)
 
-    # 공통 필드 (항상 6개 고정)
+    # 공통 필드 (항상 최소 6개)
     payload: Dict[str, Any] = {
         "status": 200,
-        "success": True,
+        "success": bool(success),
         "timeStamp": int(time.time() * 1000),          # ms 단위
         "type": normalized_type,
         "jobId": str(job_id),
@@ -144,6 +150,10 @@ async def report_progress_to_spring(
     if normalized_type in ("UPLOADING", "PROCESSING") and progress is not None:
         payload["progress"] = float(progress)
 
+    # 🔹 에러 메시지가 있을 때만 message 포함
+    if message:
+        payload["message"] = str(message)
+
     # (나머지 totalBytes, sizeBytes, checksum, stage 등은
     #  인자로만 받고 payload 에는 넣지 않는다.)
 
@@ -152,7 +162,8 @@ async def report_progress_to_spring(
         await redis.set(get_status_key(job_id), json.dumps(payload), ex=3600)
         logger.info(
             f"Job {job_id} status updated: type={normalized_type}, "
-            f"progress={payload.get('progress')}"
+            f"success={payload['success']}, progress={payload.get('progress')}, "
+            f"message={payload.get('message')}"
         )
     except RedisConnectionError as e:
         logger.error(f"Redis connection dropped or operation failed for Job {job_id}: {e}")
@@ -165,7 +176,8 @@ async def report_progress_to_spring(
         await redis.publish(channel, json.dumps(payload))
         logger.info(
             f"Job {job_id} progress PUBLISHED to {channel}: "
-            f"type={normalized_type}, progress={payload.get('progress')}"
+            f"type={normalized_type}, success={payload['success']}, "
+            f"progress={payload.get('progress')}, message={payload.get('message')}"
         )
     except Exception as e:
         logger.error(f"Failed to publish progress for Job {job_id} to channel: {e}")
@@ -247,9 +259,42 @@ async def _trigger_ai_worker(
         redis: Redis = get_redis_client()
     except RedisConnectionError:
         logger.error(f"Redis not available, cannot queue AI task for Job {job_id}.")
+        # 큐에 못 넣은 것도 에러로 보고
+        try:
+            try:
+                processing_type = UploadStatus.PROCESSING.value  # type: ignore[attr-defined]
+            except Exception:
+                processing_type = "PROCESSING"
+
+            await report_progress_to_spring(
+                job_id,
+                processing_type,
+                None,
+                member_id=(member_id or settings.MEMBER_ID),
+                success=False,
+                message="Redis not available, cannot queue AI task.",
+            )
+        except Exception:
+            pass
         return
     except Exception as e:
         logger.error(f"Unknown error getting Redis client for Job {job_id}: {e}")
+        try:
+            try:
+                processing_type = UploadStatus.PROCESSING.value  # type: ignore[attr-defined]
+            except Exception:
+                processing_type = "PROCESSING"
+
+            await report_progress_to_spring(
+                job_id,
+                processing_type,
+                None,
+                member_id=(member_id or settings.MEMBER_ID),
+                success=False,
+                message=f"Unknown Redis error while queuing AI task: {type(e).__name__}: {e}",
+            )
+        except Exception:
+            pass
         return
 
     # 1. AI Worker에게 전달할 페이로드 구성
@@ -290,12 +335,23 @@ async def _trigger_ai_worker(
 
     except Exception as e:
         logger.error(f"Failed to queue AI task for Job {job_id}: {e}")
-        # 에러 시에는 기존 ERROR/FAILED 플로우와 호환되도록 문자열 사용
+        # 에러 시: type=PROCESSING, success=false, message 포함
         try:
-            error_type = UploadStatus.ERROR.value  # type: ignore[attr-defined]
+            try:
+                processing_type = UploadStatus.PROCESSING.value  # type: ignore[attr-defined]
+            except Exception:
+                processing_type = "PROCESSING"
+
+            await report_progress_to_spring(
+                job_id,
+                processing_type,
+                None,
+                member_id=(member_id or settings.MEMBER_ID),
+                success=False,
+                message=f"Failed to queue AI task: {type(e).__name__}: {e}",
+            )
         except Exception:
-            error_type = "FAILED"
-        await report_progress_to_spring(job_id, error_type, None)
+            pass
 
 
 # ─────────────────────────────────────────────────────────────
@@ -391,8 +447,23 @@ async def merge_chunks_and_cleanup(
             f"Critical error during merge/cleanup/trigger for Job {job_id}: {e}",
             exc_info=True,
         )
-        # 에러 시 기존 문자열 상태 유지 ("FAILED")
-        await report_progress_to_spring(job_id, "FAILED", None)
+        # 업로드 단계 에러: type=UPLOADING, success=false, message 포함
+        try:
+            try:
+                uploading_type = UploadStatus.UPLOADING.value  # type: ignore[attr-defined]
+            except Exception:
+                uploading_type = "UPLOADING"
+
+            await report_progress_to_spring(
+                job_id,
+                uploading_type,
+                None,
+                member_id=(member_id or settings.MEMBER_ID),
+                success=False,
+                message=f"Error during merge/cleanup/trigger: {type(e).__name__}: {e}",
+            )
+        except Exception:
+            pass
     finally:
         # 7) 임시 청크 폴더 삭제
         try:

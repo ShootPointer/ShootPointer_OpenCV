@@ -84,7 +84,7 @@ def _to_relative_highlight_path(full_path: str) -> str:
 
 def _build_payload(
     job_id: str,
-    member_id: str,
+    member_id: str,  # 현재는 payload 에 사용하지 않고, 헤더(X-Member-Id)로만 사용
     highlight_id: str,
     output_files_with_segments: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -181,14 +181,31 @@ def _send_highlight_sync(
                     if response_json.get("success") is True:
                         logger.info("✅ HTTP POST Success: Status 200 & success: true")
                         return True
-                    logger.warning("❌ API Internal Failure (success: false). Retrying...")
+
+                    # success:false 인 경우, message / error 도 같이 로그
+                    message = (
+                        response_json.get("message")
+                        or response_json.get("error")
+                        or str(response_json)
+                    )
+                    logger.warning(
+                        "❌ API Internal Failure (success: false). "
+                        f"message={message}. Retrying..."
+                    )
                 except json.JSONDecodeError:
-                    logger.error("⚠️ 응답 JSON 디코딩 실패. Retrying...")
+                    logger.error(
+                        "⚠️ 응답 JSON 디코딩 실패. Raw response text: %r. Retrying...",
+                        response.text,
+                    )
             else:
-                logger.error(f"❌ HTTP Status Code Error: {response.status_code}. Retrying...")
+                # 200 이 아닌 경우, body 도 같이 출력
+                logger.error(
+                    f"❌ HTTP Status Code Error: {response.status_code}. "
+                    f"Response body: {response.text}"
+                )
 
         except requests.exceptions.RequestException as e:
-            logger.error(f"❌ HTTP Request Error: {e.__class__.__name__}. Retrying...")
+            logger.error(f"❌ HTTP Request Error: {e.__class__.__name__}: {e}. Retrying...")
 
         # 재시도 대기 (지수 백오프)
         if attempt < MAX_RETRIES - 1:

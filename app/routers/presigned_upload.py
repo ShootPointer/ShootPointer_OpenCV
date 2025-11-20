@@ -57,6 +57,7 @@ def _b64_any_decode(s: str) -> bytes:
 # ─────────────────────────────────────────────────────────────
 _ALLOWED_EXTS = {".mp4", ".mkv", ".mov", ".m4v"}
 
+
 def _sanitize_filename(name: str, max_len: int = 120) -> str:
     """
     - 경로 구분자 제거
@@ -71,7 +72,7 @@ def _sanitize_filename(name: str, max_len: int = 120) -> str:
     name = name.replace("\\", "/").split("/")[-1]
 
     # 허용 문자만 남김 (한글 허용 필요 시 [^A-Za-z0-9._\\- ㄱ-힣] 등으로 확장)
-    name = re.sub(r"[^A-Za-z0-9._\- ]", "_", name).strip()
+    name = re.sub(r"[^A-Za-z0-9._\\- ]", "_", name).strip()
     if not name:
         raise HTTPException(status_code=400, detail="invalid_filename: sanitized_to_empty")
 
@@ -132,6 +133,7 @@ async def upload_presigned_chunk(
     - fileName은 폼에서 받고 sanitize + 확장자 체크 + jobId 단위로 락
     """
     job_id: Optional[str] = None
+    member_id: Optional[str] = None  # ✅ progress 전송 시 사용
 
     try:
         # 0) 유효성 검사
@@ -142,7 +144,7 @@ async def upload_presigned_chunk(
         try:
             token_data: DecryptedToken = crypto.decrypt_token(presignedToken)
             job_id = token_data.jobId
-            member_id = token_data.memberId  # 로그/추적용
+            member_id = token_data.memberId  # 로그/추적 + Redis progress용
         except ValueError as e:
             logger.error(f"Token validation failed (ValueError) / ERR-A: {e}")
             # ERR-A: 토큰 복호화 실패/만료/변조 시 401
@@ -195,21 +197,29 @@ async def upload_presigned_chunk(
 
         # ✅ 청크 업로드 진행률 보고 (0 ~ 90%)
         try:
-            # 전체 업로드에서 청크 업로드 단계는 0~90% 구간 사용
-            upload_ratio = chunkIndex / totalParts  # 0.0 ~ 1.0
-            progress_int = int(round(upload_ratio * 90))  # 0 ~ 90 정수
+            # memberId / jobId 가 없으면 SUB 보내지 않음
+            if job_id and member_id:
+                # 전체 업로드에서 청크 업로드 단계는 0~90% 구간 사용
+                upload_ratio = chunkIndex / totalParts  # 0.0 ~ 1.0
+                progress_int = int(round(upload_ratio * 90))  # 0 ~ 90 정수
 
-            # 0%로 남지 않도록 1%부터 시작, 최대 90%까지만
-            if progress_int < 1:
-                progress_int = 1
-            if progress_int > 90:
-                progress_int = 90
+                # 0%로 남지 않도록 1%부터 시작, 최대 90%까지만
+                if progress_int < 1:
+                    progress_int = 1
+                if progress_int > 90:
+                    progress_int = 90
 
-            await report_progress_to_spring(
-                job_id,
-                UploadStatus.UPLOADING.value,  # "UPLOADING"
-                float(progress_int),
-            )
+                await report_progress_to_spring(
+                    job_id,
+                    UploadStatus.UPLOADING.value,  # "UPLOADING"
+                    float(progress_int),
+                    member_id=member_id,           # ✅ 기본값(test_user_001) 쓰지 않도록 명시 전달
+                )
+            else:
+                logger.warning(
+                    f"[upload_chunk] Skip reporting progress because jobId or memberId is missing "
+                    f"(jobId={job_id}, memberId={member_id})"
+                )
         except Exception as e:
             # 진행률 보고 실패해도 업로드 자체는 계속 되도록
             logger.error(

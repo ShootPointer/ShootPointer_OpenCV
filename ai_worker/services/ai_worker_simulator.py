@@ -99,7 +99,8 @@ async def _publish_progress(job_id: str, payload: Dict[str, Any]) -> None:
         await redis.publish(channel_name, json.dumps(payload))
         logger.info(
             f"[{job_id}] Progress PUBLISHED to {channel_name}: "
-            f"type={payload.get('type')}, progress={payload.get('progress')}"
+            f"type={payload.get('type')}, success={payload.get('success')}, "
+            f"progress={payload.get('progress')}, message={payload.get('message')}"
         )
     except Exception as e:
         logger.error(f"[{job_id}] Failed to PUBLISH progress via Pub/Sub: {e}")
@@ -161,12 +162,14 @@ async def _report_completion(
     total_clips: int,
     highlight_id: Optional[str] = None,
     output_paths: Optional[List[str]] = None,
+    error_message: Optional[str] = None,
 ) -> None:
     """
     ProgressType.COMPLETE 단계 보고.
 
     👉 최종 Redis/PubSub JSON 형식 (AI 처리 완료):
 
+    (성공)
     {
       "status": 200,
       "success": true,
@@ -176,6 +179,17 @@ async def _report_completion(
       "memberId": "xxxx"
     }
 
+    (에러)
+    {
+      "status": 200,
+      "success": false,
+      "timeStamp": 1731990003000,
+      "type": "COMPLETE",
+      "jobId": "job1",
+      "memberId": "xxxx",
+      "message": "에러 설명"
+    }
+
     - COMPLETE 단계에서는 progress / stage / currentClip / totalClips 등은
       전송하지 않는다.
     """
@@ -183,12 +197,16 @@ async def _report_completion(
 
     payload: Dict[str, Any] = {
         "status": 200,
-        "success": success,
+        "success": bool(success),
         "timeStamp": int(time.time() * 1000),
         "type": "COMPLETE",
         "memberId": str(member_id),
         "jobId": str(job_id),
     }
+
+    # 에러 시에는 message 포함
+    if not success and error_message:
+        payload["message"] = str(error_message)
 
     await _publish_progress(job_id, payload)
 
@@ -388,7 +406,7 @@ async def process_task(task: AITaskPayload):
     highlight_id = (task.highlightIdentifier or "").strip()
 
     if not highlight_id:
-        # 하이라이트 키 없으면 즉시 실패
+        # 하이라이트 키 없으면 즉시 실패 (COMPLETE + success:false + message)
         await _report_completion(
             job_id=job_id,
             member_id=member_id,
@@ -396,6 +414,7 @@ async def process_task(task: AITaskPayload):
             total_clips=0,
             highlight_id=None,
             output_paths=[],
+            error_message="highlightKey/highlightIdentifier is missing in payload.",
         )
         logger.error(f"[{job_id}] Task FAILED: highlightKey/highlightIdentifier is missing in payload.")
         return
@@ -527,7 +546,7 @@ async def process_task(task: AITaskPayload):
         final_output_paths = [d["output_path"] for d in output_files_with_segments]
 
         if not output_files_with_segments:
-            # 하이라이트가 없으면 HTTP 전송 없이 COMPLETE 만 보고
+            # 하이라이트가 없으면 HTTP 전송 없이 COMPLETE 만 보고 (성공)
             await _report_completion(
                 job_id=job_id,
                 member_id=member_id,
@@ -565,7 +584,7 @@ async def process_task(task: AITaskPayload):
 
         logger.info(f"[{job_id}] {final_message}. Total output files: {len(output_files_with_segments)}")
 
-    except FileNotFoundError:
+    except FileNotFoundError as e:
         await _report_completion(
             job_id=job_id,
             member_id=member_id,
@@ -573,6 +592,7 @@ async def process_task(task: AITaskPayload):
             total_clips=0,
             highlight_id=highlight_id,
             output_paths=[],
+            error_message=str(e),
         )
         logger.error(f"[{job_id}] Task FAILED: Original file not found at {original_path}")
     except Exception as e:
@@ -583,6 +603,7 @@ async def process_task(task: AITaskPayload):
             total_clips=0,
             highlight_id=highlight_id,
             output_paths=[],
+            error_message=f"Unexpected error in AI worker: {type(e).__name__}: {e}",
         )
         logger.error(f"[{job_id}] Task FAILED unexpectedly: {type(e).__name__}: {e}")
 
