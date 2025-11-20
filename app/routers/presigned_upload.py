@@ -209,6 +209,7 @@ async def upload_presigned_chunk(
                 if progress_int > 90:
                     progress_int = 90
 
+
                 await report_progress_to_spring(
                     job_id,
                     UploadStatus.UPLOADING.value,  # "UPLOADING"
@@ -220,6 +221,7 @@ async def upload_presigned_chunk(
                     f"[upload_chunk] Skip reporting progress because jobId or memberId is missing "
                     f"(jobId={job_id}, memberId={member_id})"
                 )
+
         except Exception as e:
             # 진행률 보고 실패해도 업로드 자체는 계속 되도록
             logger.error(
