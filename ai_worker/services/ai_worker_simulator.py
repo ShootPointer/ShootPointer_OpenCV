@@ -35,7 +35,7 @@ except ImportError as e:
 
 
 class Settings(BaseModel):
-    REDIS_URL: str = os.getenv("REDIS_URL", "redis://:rlaehdus00!!@host.docker.internal:6379/0")
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://:rlaehdus00123@host.docker.internal:6379/0")
     AI_QUEUE_NAME: str = os.getenv("REDIS_AI_JOB_QUEUE", "opencv-ai-job-queue")
     SPRING_API_URL: str = os.getenv("SPRING_API_URL", "http://host.docker.internal:8080/api/v1/jobs")
     OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "/data/highlights/processed")
