@@ -649,3 +649,4 @@ if __name__ == "__main__":
         logger.critical("AI Worker cannot start without Redis connection. Please check Redis URL.")
     except Exception as e:
         logger.error(f"Worker crashed during startup: {e}")
+#코드수정완료
