@@ -209,6 +209,7 @@ async def upload_presigned_chunk(
                 job_id,
                 UploadStatus.UPLOADING.value,  # "UPLOADING"
                 float(progress_int),
+                member_id
             )
         except Exception as e:
             # 진행률 보고 실패해도 업로드 자체는 계속 되도록
