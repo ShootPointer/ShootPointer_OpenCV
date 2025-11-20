@@ -72,7 +72,7 @@ def _sanitize_filename(name: str, max_len: int = 120) -> str:
     name = name.replace("\\", "/").split("/")[-1]
 
     # 허용 문자만 남김 (한글 허용 필요 시 [^A-Za-z0-9._\\- ㄱ-힣] 등으로 확장)
-    name = re.sub(r"[^A-Za-z0-9._\\- ]", "_", name).strip()
+    name = re.sub(r"[^A-Za-z0-9._\\ -]", "_", name).strip()
     if not name:
         raise HTTPException(status_code=400, detail="invalid_filename: sanitized_to_empty")
 
