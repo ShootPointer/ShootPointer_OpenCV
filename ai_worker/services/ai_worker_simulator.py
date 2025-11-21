@@ -356,7 +356,7 @@ def _run_ffmpeg_cut(job_id: str, src_path: str, segment: Dict[str, Any], output_
         # ▼ 재인코딩 설정 (모바일/Expo-AV/ExoPlayer 친화)
         # 해상도: 가로 1280, 세로는 비율 유지 + 짝수(-2)
         "-vf",
-        "scale=1280:-2",
+        "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1",
         # 비디오 코덱: H.264
         "-c:v",
         "libx264",
