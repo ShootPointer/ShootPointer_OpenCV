@@ -181,7 +181,11 @@ app.mount(
     StaticFiles(directory=settings.SAVE_ROOT, html=False),
     name="static-highlights",
 )
-
+app.mount(
+    "/highlight",
+    StaticFiles(directory="/home/videos/highlight", html=False),
+    name="highlight-files",
+)
 
 # ─────────────────────────────────────────────────────────────
 # 스타트업: 셀프체크 및 Redis 연결 초기화
