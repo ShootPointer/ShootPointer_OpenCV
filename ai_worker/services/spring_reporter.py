@@ -124,7 +124,7 @@ def _build_payload(
         # 최종적으로 백엔드에 전달되는 값:
         #   highlight/{relative_path}
         # 예) highlight/a1d1f806c8324d02/a1d1f806c8324d02_segment_01.mp4
-        relative_url = f"https://tkv00.ddns.net/highlight/{relative_path.lstrip('/')}"
+        relative_url = f"highlight/{relative_path.lstrip('/')}"
 
 
         segment_label = item["segment"].get("label", "UNKNOWN")
