@@ -6,7 +6,7 @@
 DURATION_TOLERANCE_SEC = 2.0 
 PHASH_HAMMING_THRESHOLD = 6
 # 💡 [NEW] 파일 크기 허용 오차: 10KB (10240 Bytes)를 기준으로 매칭합니다.
-SIZE_TOLERANCE_BYTES = 30720 
+SIZE_TOLERANCE_BYTES = 1500000 
 
 PLANS = [
     {
@@ -41,7 +41,7 @@ PLANS = [
     {
         "id": "3",
         # 크기: 39.9MB (41,912,920 Bytes)
-        "size_bytes": 41912920,
+        "size_bytes": 44000000,
         "duration_sec": 163.0,     # 00:02:43
         "width": 1274,             # 프레임 너비
         "height": 720,             # 💡 [업데이트] 높이 720으로 통일
